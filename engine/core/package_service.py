@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from engine.adb_scan import ADB_MISSING_HINT, resolve_adb_binary
 from engine.core.cloud_bridge import CloudBridge
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,8 @@ def _run_adb_command(args: list, timeout: int = 120) -> str:
             check=False,
         )
     except FileNotFoundError as exc:
-        raise PackageInstallError("本机未找到 adb 命令（请安装 Android platform-tools）", 503) from exc
+        # G3：统一中文指引（与 resolve_adb_binary 同一文案）
+        raise PackageInstallError(ADB_MISSING_HINT, 503) from exc
     except subprocess.TimeoutExpired as exc:
         raise PackageInstallError("与设备通信超时（可能设备已断开）", 504) from exc
     output = completed.stdout.decode("utf-8", errors="replace") + completed.stderr.decode(
@@ -99,7 +101,15 @@ def install_package_local(
         apk_path.write_bytes(file_bytes)
 
         install_flags = ["-r", "-t", "-d"]
-        install_cmd = ["adb", "-s", serial, "install", *install_flags, str(apk_path)]
+        # G3：adb 解析失败统一映射为 503 + 中文指引——resolve_adb_binary 在拼 argv
+        # 处抛 FileNotFoundError，若不在此处接住会以 500 Internal Server Error 冒出，
+        # ADB_MISSING_HINT 文案到不了用户（原先裸 "adb" 回退由 subprocess 抛出并被
+        # _run_adb_command 换成 503，行为必须保持）。
+        try:
+            adb_bin = resolve_adb_binary()
+        except FileNotFoundError as exc:
+            raise PackageInstallError(str(exc) or ADB_MISSING_HINT, 503) from exc
+        install_cmd = [adb_bin, "-s", serial, "install", *install_flags, str(apk_path)]
         logger.info("执行本地安装命令: %s", " ".join(shlex.quote(part) for part in install_cmd))
         output = _run_adb_command(install_cmd, timeout=_INSTALL_TIMEOUT_SECONDS)
         logger.info("ADB 安装输出: %s", output.strip())
@@ -108,7 +118,7 @@ def install_package_local(
         if "INSTALL_FAILED_VERSION_DOWNGRADE" in output and package_name:
             retried_after_uninstall = True
             logger.warning("检测到系统拦截降级安装，自动卸载旧版本并重试 (%s)", package_name)
-            _run_adb_command(["adb", "-s", serial, "uninstall", package_name], timeout=45)
+            _run_adb_command([adb_bin, "-s", serial, "uninstall", package_name], timeout=45)
             output = _run_adb_command(install_cmd, timeout=_INSTALL_TIMEOUT_SECONDS)
             logger.info("重试安装输出: %s", output.strip())
 

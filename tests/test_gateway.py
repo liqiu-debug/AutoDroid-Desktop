@@ -484,3 +484,81 @@ def test_devices_list_registers_new_local_devices_throttled(client, mock_upstrea
 
     lists = [r for r in mock_upstream.requests if r["path"].startswith("/api/devices")]
     assert len(lists) == 2, "两次 GET 都应照常透传云端权威列表"
+
+
+def test_devices_list_discovery_skips_when_round_in_flight(client, mock_upstream, monkeypatch):
+    """有在途发现轮次时（轮次锁被占）本轮直接跳过：不叠轮，列表照常透传。"""
+    scans = []
+
+    def fake_scan():
+        scans.append(1)
+        return []
+
+    monkeypatch.setattr("engine.app.scan_devices", fake_scan)
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    # 强制过节流窗口 + 人为占住轮次锁（模拟慢轮在途）
+    client.app.state.device_discovery["ts"] = 0.0
+    lock = client.app.state.device_discovery_lock
+    lock._locked = True
+    try:
+        resp = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
+    finally:
+        lock._locked = False
+
+    assert resp.status_code == 200
+    assert [d["serial"] for d in resp.json()] == ["MOCK1", "MOCK2"]
+    assert scans == [], "在途轮次期间不得再叠一轮扫描"
+
+
+def test_devices_list_discovery_rounds_do_not_overlap(client, mock_upstream, monkeypatch):
+    """慢轮跑过节流窗口后并发 GET：轮次锁保证同一时刻至多一轮扫描/上报。"""
+    import threading
+    import time
+
+    counter = {"active": 0, "max": 0, "calls": 0}
+    counter_lock = threading.Lock()
+
+    def slow_scan():
+        with counter_lock:
+            counter["calls"] += 1
+            counter["active"] += 1
+            counter["max"] = max(counter["max"], counter["active"])
+        # 模拟慢轮：跑过 10s 节流窗口（让并发请求也想触发新一轮）
+        client.app.state.device_discovery["ts"] = 0.0
+        time.sleep(0.4)
+        with counter_lock:
+            counter["active"] -= 1
+        return []
+
+    monkeypatch.setattr("engine.app.scan_devices", slow_scan)
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+
+    results = []
+    errors = []
+
+    def hit():
+        try:
+            results.append(client.get("/api/devices/", headers={"Authorization": "Bearer tok"}))
+        except Exception as exc:  # pragma: no cover - 测试失败时暴露
+            errors.append(exc)
+
+    first = threading.Thread(target=hit)
+    first.start()
+    time.sleep(0.1)  # 让第一轮进入 slow_scan
+    second = threading.Thread(target=hit)
+    second.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not errors, errors
+    assert len(results) == 2 and all(r.status_code == 200 for r in results)
+    assert counter["calls"] >= 1
+    assert counter["max"] == 1, f"发现轮次叠跑了: max={counter['max']}"

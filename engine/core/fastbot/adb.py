@@ -7,6 +7,8 @@ import asyncio
 import re
 from typing import Dict, Optional
 
+from engine.adb_scan import resolve_adb_binary
+
 ADB_MONITOR_COMMAND_TIMEOUT_SECONDS = 8
 
 # serial 白名单（adb/网络隧道形态）；包名白名单（Android 包命名规范）
@@ -61,7 +63,7 @@ async def _adb_shell_result(
     # exec 参数数组：cmd 整串作为单个 argv 交给设备侧 shell 解释（与原
     # `adb -s x shell {cmd}` 语义一致），宿主 shell 不再参与拼接。
     proc = await asyncio.create_subprocess_exec(
-        "adb", "-s", serial, "shell", str(cmd),
+        resolve_adb_binary(), "-s", serial, "shell", str(cmd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -87,7 +89,7 @@ async def _adb_shell_result(
 async def _adb_push(device_serial: str, local: str, remote: str):
     serial = validate_device_serial(device_serial)
     proc = await asyncio.create_subprocess_exec(
-        "adb", "-s", serial, "push", str(local), str(remote),
+        resolve_adb_binary(), "-s", serial, "push", str(local), str(remote),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -97,7 +99,7 @@ async def _adb_push(device_serial: str, local: str, remote: str):
 async def _adb_pull(device_serial: str, remote: str, local: str):
     serial = validate_device_serial(device_serial)
     proc = await asyncio.create_subprocess_exec(
-        "adb", "-s", serial, "pull", str(remote), str(local),
+        resolve_adb_binary(), "-s", serial, "pull", str(remote), str(local),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

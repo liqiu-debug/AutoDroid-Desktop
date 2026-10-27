@@ -35,6 +35,30 @@ $pyVer = python --version 2>&1
 Ok "python: $pyVer"
 Ok "node: $(node --version) / npm: $(npm --version)"
 
+# ---------- 0.5 内置 platform-tools（Google 官方 adb 随包分发；产物不入库） ----------
+# 分平台目录 assets\platform-tools\windows（G2 闭环）：与 mac 的 darwin/ 各自独立，
+# 供 electron-builder per-platform extraResources 引用，绝不混装对方平台二进制。
+Step '准备内置 Android platform-tools（Google 官方）'
+$adbExe = 'assets\platform-tools\windows\adb.exe'
+if (Test-Path $adbExe) {
+    Ok "platform-tools 已存在: $adbExe（跳过下载；删除该目录可强制更新）"
+} else {
+    $ptUrl = 'https://dl.google.com/android/repository/platform-tools-latest-windows.zip'
+    $zipPath = Join-Path $env:TEMP 'autodroid-platform-tools.zip'
+    $extractDir = Join-Path $env:TEMP 'autodroid-platform-tools-extract'
+    Write-Host "    下载 $ptUrl ..."
+    Invoke-WebRequest -Uri $ptUrl -OutFile $zipPath -UseBasicParsing
+    if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+    $srcDir = Join-Path $extractDir 'platform-tools'
+    if (-not (Test-Path (Join-Path $srcDir 'adb.exe'))) { Fail 'platform-tools 解压异常：未找到 adb.exe' }
+    if (-not (Test-Path 'assets\platform-tools')) { New-Item -ItemType Directory -Path 'assets\platform-tools' | Out-Null }
+    if (Test-Path 'assets\platform-tools\windows') { Remove-Item -Recurse -Force 'assets\platform-tools\windows' }
+    Move-Item $srcDir 'assets\platform-tools\windows'
+    Remove-Item -Force $zipPath
+    Ok "platform-tools 就绪: $adbExe"
+}
+
 # ---------- 1. 引擎（PyInstaller onedir → release-engine\autodroid-engine\autodroid-engine.exe） ----------
 Step '构建本地引擎（首次约 2-5 分钟）'
 if (-not (Test-Path '.venv\Scripts\python.exe')) {

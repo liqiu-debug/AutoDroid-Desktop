@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, List, Optional
 
+from engine.adb_scan import resolve_adb_binary
 from engine.core.fastbot.adb import _terminate_subprocess, validate_device_serial
 
 logger = logging.getLogger("FastbotRunner")
@@ -53,7 +54,7 @@ async def _monitor_logcat(
             logger.warning("Crash/ANR event sink failed and was ignored: %s", exc)
 
     proc = await asyncio.create_subprocess_exec(
-        "adb", "-s", validate_device_serial(device_serial), "logcat", "-v", "time", "*:E",
+        resolve_adb_binary(), "-s", validate_device_serial(device_serial), "logcat", "-v", "time", "*:E",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -182,7 +183,7 @@ async def _monitor_logcat(
 async def _capture_logcat_snapshot(device_serial: str) -> str:
     """截取最近 500 行 logcat"""
     proc = await asyncio.create_subprocess_exec(
-        "adb", "-s", validate_device_serial(device_serial), "logcat", "-d", "-t", "500",
+        resolve_adb_binary(), "-s", validate_device_serial(device_serial), "logcat", "-d", "-t", "500",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

@@ -28,6 +28,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,11 @@ from engine.core.recording_service import RecordingError
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# 视频泵专用线程池：get_video_generator 的 next() 等帧可能长占调用线程
+# （无帧 deadline 内会一直持有），必须与 dump/interact/touch 共用的默认
+# asyncio 线程池隔离，避免视频泵把默认池占死后本地设备 I/O 全体饿死。
+VIDEO_PUMP_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="autodroid-video-pump")
 
 
 def _json_response_with_optional_gzip(request: Request, payload: Any) -> Response:
@@ -1041,7 +1047,9 @@ async def scrcpy_video_stream(websocket: WebSocket, serial: str) -> None:
                 return None
 
         while True:
-            chunk = await loop.run_in_executor(None, _next_chunk)
+            # 视频泵走专用线程池（不与 dump/interact/touch 共用默认池）：
+            # next() 等帧可能长占调用线程，混用默认池会把本地设备 I/O 饿死。
+            chunk = await loop.run_in_executor(VIDEO_PUMP_EXECUTOR, _next_chunk)
             if chunk is None:
                 break
             await websocket.send_bytes(chunk)

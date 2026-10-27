@@ -1,8 +1,19 @@
 """本机 adb 设备扫描（adbutils）。
 
-adb 路径发现逻辑与 AutoDroid/scripts/device_agent.py 的 find_adb_path 对齐：
-显式指定 > PATH > %LOCALAPPDATA%\\Android\\Sdk\\platform-tools（Windows）
-/ ~/Library/Android/sdk/platform-tools 等常见 SDK 安装路径。
+adb 路径发现（find_adb_path）是全链路唯一入口——subprocess/adbutils/uiautomator2
+的 adb 可执行路径都从这里解析：
+
+    显式参数 > env AUTODROID_ADB > env ADBUTILS_ADB_PATH
+    > 内置 platform-tools（打包态 resourcesPath/platform-tools/adb[.exe]；
+      开发态 assets/platform-tools/<darwin|windows>/（兼容旧扁平布局），
+      由 scripts/fetch-platform-tools.sh 产出）
+    > PATH > ANDROID_HOME / ANDROID_SDK_ROOT 的 platform-tools、
+      %LOCALAPPDATA%\\Android\\Sdk\\platform-tools（Windows）
+      / ~/Android/platform-tools、~/Library/Android/sdk/platform-tools
+      等常见 SDK 安装路径（兜底）。
+
+adbutils（uiautomator2 经由 adbutils）通过 ADBUTILS_ADB_PATH 选择 adb 路径，
+apply_adb_path 负责把解析结果注入该环境变量，保证「一个 adb 管到底」。
 """
 from __future__ import annotations
 
@@ -10,55 +21,155 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+AUTODROID_ADB_ENV = "AUTODROID_ADB"
+ADBUTILS_ADB_PATH_ENV = "ADBUTILS_ADB_PATH"
+
+# G3：adb 解析失败的统一中文指引（resolve_adb_binary 抛错 / scan_devices 日志共用）
+ADB_MISSING_HINT = (
+    "未检测到 adb：请安装 Android platform-tools 或使用内置 adb"
+    "（把 adb 所在目录加入 PATH，或设置 ANDROID_HOME / AUTODROID_ADB 指向 adb）"
+)
+
 _server_ready = False
 
 
-def find_adb_path(explicit: Optional[str] = None) -> Optional[str]:
-    """定位 adb 可执行文件：显式参数 > PATH > 常见 SDK 安装路径。"""
+def _adb_exe_name() -> str:
+    return "adb.exe" if os.name == "nt" else "adb"
+
+
+def _platform_tools_dir_name() -> str:
+    """开发态分平台目录名（fetch-platform-tools.sh / build-windows.ps1 产出目录）。"""
+    if os.name == "nt":
+        return "windows"
+    return "darwin" if sys.platform == "darwin" else "linux"
+
+
+def _bundled_platform_tools_candidates() -> List[str]:
+    """内置 platform-tools 的 adb 候选路径（打包态 resourcesPath、开发态仓库 assets）。
+
+    开发态按分平台目录（assets/platform-tools/<darwin|windows>/）优先，兼容
+    旧扁平布局 assets/platform-tools/；打包态 extraResources 已把分平台目录
+    内容平铺到 resourcesPath/platform-tools/（扁平优先）。
+    """
+    exe_name = _adb_exe_name()
     candidates: List[str] = []
-    if explicit:
-        candidates.append(explicit)
-    found = shutil.which("adb")
-    if found:
-        candidates.append(found)
+    # 打包态：extraResources 把 assets/platform-tools/<平台>/ 平铺到
+    # resourcesPath/platform-tools/，AUTODROID_ENGINE_ASSETS_DIR（resourcesPath/assets）
+    # 的同级目录即同一位置的显式锚点。
+    assets_dir = os.environ.get("AUTODROID_ENGINE_ASSETS_DIR", "").strip()
+    if assets_dir:
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.abspath(assets_dir)), "platform-tools", exe_name)
+        )
+    # 打包态兜底：引擎 onedir 位于 resourcesPath/engine-bin/<name>/，从可执行文件向上
+    # 回溯即可命中 resourcesPath/platform-tools（AUTODROID_ENGINE_ASSETS_DIR 缺席时）。
+    if getattr(sys, "frozen", False):
+        probe = os.path.dirname(os.path.abspath(sys.executable))
+        for _ in range(4):
+            candidates.append(os.path.join(probe, "platform-tools", exe_name))
+            probe = os.path.dirname(probe)
+    # 开发态：仓库 assets/platform-tools/<平台>/（fetch 脚本产物）优先，
+    # 兼容旧扁平布局 assets/platform-tools/
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates.append(
+        os.path.join(repo_root, "assets", "platform-tools", _platform_tools_dir_name(), exe_name)
+    )
+    candidates.append(os.path.join(repo_root, "assets", "platform-tools", exe_name))
+    return candidates
+
+
+def _sdk_candidates() -> List[str]:
+    """常见 Android SDK 安装路径的 adb 候选（最终兜底）。
+
+    顺序：ANDROID_HOME / ANDROID_SDK_ROOT 指向的 platform-tools（用户显式配置）
+    > 各平台常见安装路径（含 ~/Android/platform-tools 这类用户机器真实布局）。
+    """
+    exe_name = _adb_exe_name()
     home = os.path.expanduser("~")
+    candidates: List[str] = []
+    for env_name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append(os.path.join(value, "platform-tools", exe_name))
     if os.name == "nt":
         local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
         candidates.extend(
             [
-                os.path.join(local_appdata, "Android", "Sdk", "platform-tools", "adb.exe"),
-                os.path.join(home, "AppData", "Local", "Android", "Sdk", "platform-tools", "adb.exe"),
+                os.path.join(local_appdata, "Android", "Sdk", "platform-tools", exe_name),
+                os.path.join(home, "AppData", "Local", "Android", "Sdk", "platform-tools", exe_name),
                 r"C:\platform-tools\adb.exe",
             ]
         )
     else:
         candidates.extend(
             [
+                os.path.join(home, "Android", "platform-tools", "adb"),
                 os.path.join(home, "Library", "Android", "sdk", "platform-tools", "adb"),
                 os.path.join(home, "Android", "Sdk", "platform-tools", "adb"),
                 "/opt/homebrew/bin/adb",
                 "/usr/local/bin/adb",
             ]
         )
+    return candidates
+
+
+def find_adb_path(explicit: Optional[str] = None) -> Optional[str]:
+    """定位 adb 可执行文件（全链路唯一入口）。
+
+    优先级：显式参数 > env AUTODROID_ADB > env ADBUTILS_ADB_PATH
+    > 内置 platform-tools > PATH > 常见 SDK 安装路径。
+    """
+    candidates: List[str] = []
+    if explicit:
+        candidates.append(explicit)
+    for env_name in (AUTODROID_ADB_ENV, ADBUTILS_ADB_PATH_ENV):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append(value)
+    candidates.extend(_bundled_platform_tools_candidates())
+    found = shutil.which("adb")
+    if found:
+        candidates.append(found)
+    candidates.extend(_sdk_candidates())
     for path in candidates:
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return None
 
 
-def _ensure_adb(adb: Optional[str]) -> bool:
-    """发现 adb 并确保 adb server 在位，返回是否可用。"""
+def resolve_adb_binary() -> str:
+    """subprocess argv[0] 用的 adb 路径。
+
+    G3：解析不到时不再回退裸 "adb"（下游只会抛原始 FileNotFoundError，无指引），
+    直接抛带统一中文指引的 FileNotFoundError（ADB_MISSING_HINT）。
+    """
+    resolved = find_adb_path()
+    if not resolved:
+        raise FileNotFoundError(ADB_MISSING_HINT)
+    return resolved
+
+
+def apply_adb_path(path: Optional[str] = None) -> Optional[str]:
+    """把解析结果注入 ADBUTILS_ADB_PATH（adbutils/uiautomator2 全链路统一）。"""
+    resolved = path or find_adb_path()
+    if resolved:
+        os.environ[ADBUTILS_ADB_PATH_ENV] = resolved
+    return resolved
+
+
+def ensure_server_started(adb: Optional[str] = None) -> bool:
+    """发现 adb、注入 adbutils 环境并 start-server 一次自愈（进程内只跑一次）。"""
     global _server_ready
-    path = adb or find_adb_path()
+    path = apply_adb_path(adb)
     if not path:
-        logger.warning("未找到 adb 可执行文件，跳过本机设备扫描")
+        # G3：失败日志统一携带 adb 缺失指引
+        logger.warning("%s，跳过本机设备扫描", ADB_MISSING_HINT)
         return False
-    # adbutils 通过该环境变量选择 adb 路径
-    os.environ.setdefault("ADBUTILS_ADB_PATH", path)
     if not _server_ready:
         try:
             subprocess.run([path, "start-server"], capture_output=True, timeout=15, check=False)
@@ -80,7 +191,7 @@ def scan_devices(adb: Optional[str] = None) -> List[Dict[str, Any]]:
 
     仅包含 state == device 的 Android 设备；单台属性读取失败不阻塞其余设备。
     """
-    if not _ensure_adb(adb):
+    if not ensure_server_started(adb):
         return []
 
     try:
@@ -93,7 +204,8 @@ def scan_devices(adb: Optional[str] = None) -> List[Dict[str, Any]]:
     try:
         devices = adbutils.adb.device_list()
     except Exception as exc:
-        logger.warning("adb 设备列表获取失败: %s", exc)
+        # G3：扫描失败日志统一携带 adb 指引（排查时先确认 adb 可用）
+        logger.warning("adb 设备列表获取失败: %s（%s）", exc, ADB_MISSING_HINT)
         return []
 
     for device in devices:
