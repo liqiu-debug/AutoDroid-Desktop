@@ -1,0 +1,58 @@
+# Windows 安装包 CI（可选路径：推送到 GitHub 后自动出包，无需本地 Windows 机器）
+#
+# 用法：把 AutoDroid-Desktop 推送到 GitHub（与 AutoDroid 平台仓库同组织），
+# 本工作流在 windows-latest 上构建 引擎 → 前端 → NSIS 安装包，产物挂在
+# Actions 运行页的 Artifacts（AutoDroid-Windows-Setup）。
+#
+# 触发：手动 workflow_dispatch（按需出包），或打 tag 时。
+name: build-windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout AutoDroid-Desktop
+        uses: actions/checkout@v4
+        with:
+          path: AutoDroid-Desktop
+
+      - name: Checkout AutoDroid (frontend dist 源)
+        uses: actions/checkout@v4
+        with:
+          repository: liqiu-debug/AutoDroid
+          path: AutoDroid
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build frontend dist
+        working-directory: AutoDroid/frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Build engine + installer
+        working-directory: AutoDroid-Desktop
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoDroid-Windows-Setup
+          path: AutoDroid-Desktop/release/*.exe
+          if-no-files-found: error

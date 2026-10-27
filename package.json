@@ -1,0 +1,100 @@
+{
+  "name": "autodroid-desktop",
+  "productName": "AutoDroid",
+  "version": "1.0.0",
+  "description": "AutoDroid 桌面客户端（Electron 壳 + 本地引擎网关）",
+  "main": "main.js",
+  "license": "MIT",
+  "author": "AutoDroid",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "check": "node --check main.js && node --check preload.js && node --check login_store.js && node --check updater.js",
+    "check:bridge": "electron tests/electron_bridge_check.js",
+    "test:engine": "PY=./.venv/bin/python; if [ ! -x \"$PY\" ]; then PY=python3; fi; $PY -m pytest tests -q",
+    "test:smoke": "bash tests/smoke_engine.sh && PY=./.venv/bin/python; if [ ! -x \"$PY\" ]; then PY=python3; fi; $PY tests/smoke_ws.py",
+    "dist:engine": "PY=./.venv/bin/python; if [ ! -x \"$PY\" ]; then PY=python3; fi; $PY -m PyInstaller --clean --noconfirm --distpath release-engine --workpath build-engine engine.spec",
+    "dist": "electron-builder --win --mac",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.autojs.autodroid",
+    "productName": "AutoDroid",
+    "copyright": "Copyright © 2026 AutoDroid",
+    "directories": {
+      "output": "release",
+      "buildResources": "assets"
+    },
+    "files": [
+      "*.js",
+      "assets/**/*",
+      "engine/**/*.py",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../AutoDroid/frontend/dist",
+        "to": "frontend-dist",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "release-engine",
+        "to": "engine-bin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "assets",
+        "to": "assets",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "AutoDroid"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icon.icns"
+    }
+  }
+}

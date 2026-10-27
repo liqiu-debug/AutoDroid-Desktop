@@ -1,0 +1,15 @@
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+adbutils>=2.7
+websockets>=12
+# 定时任务本地触发（P3-1，对齐平台 scheduler_service 语义）
+apscheduler>=3.10,<4
+# 本地录制/执行（engine/core vendor 自 AutoDroid backend）
+Pillow>=12.1
+uiautomator2>=3.5
+numpy>=1.26
+opencv-python>=4.10
+# iOS 执行（engine/core/drivers/ios_*）可后置：未安装时仅 Android 可用
+# facebook-wda>=1.5
+findit
