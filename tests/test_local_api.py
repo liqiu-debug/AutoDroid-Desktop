@@ -451,6 +451,32 @@ def test_ws_scrcpy_streams_frames(client, mock_cloud, fake_stream_manager):
     assert not [r for r in mock_cloud.requests if "scrcpy" in r["path"]]
 
 
+def test_ws_scrcpy_video_pump_uses_dedicated_executor(client, fake_stream_manager, monkeypatch):
+    """视频泵 next() 走专用线程池（C4：不与 dump/interact/touch 共用默认池）。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from engine import local_api
+
+    class _RecordingExecutor(ThreadPoolExecutor):
+        def __init__(self):
+            super().__init__(max_workers=2)
+            self.calls = 0
+
+        def submit(self, fn, *args, **kwargs):
+            self.calls += 1
+            return super().submit(fn, *args, **kwargs)
+
+    recorder = _RecordingExecutor()
+    monkeypatch.setattr(local_api, "VIDEO_PUMP_EXECUTOR", recorder)
+    try:
+        with client.websocket_connect("/ws/scrcpy/USB1") as ws:
+            assert ws.receive_bytes() == b"\x00\x00\x00\x01SPS"
+            assert ws.receive_bytes() == b"\x00\x00\x00\x01IDR"
+    finally:
+        recorder.shutdown(wait=False)
+    assert recorder.calls >= 3, f"视频泵未走专用线程池: calls={recorder.calls}"
+
+
 def test_ws_scrcpy_unknown_device_closes_with_4004(client, fake_stream_manager):
     from starlette.websockets import WebSocketDisconnect
 

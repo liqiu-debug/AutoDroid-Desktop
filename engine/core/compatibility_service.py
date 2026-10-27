@@ -38,6 +38,7 @@ import threading
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from engine.adb_scan import resolve_adb_binary
 from engine.core.cloud_bridge import CloudBridge
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,9 @@ async def _default_adb_runner(cmd: str, timeout: float) -> str:
     import subprocess
 
     argv = shlex.split(str(cmd))
+    if argv and argv[0] == "adb":
+        # 全链路统一：adb 可执行路径经 engine.adb_scan 唯一入口解析
+        argv[0] = resolve_adb_binary()
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,

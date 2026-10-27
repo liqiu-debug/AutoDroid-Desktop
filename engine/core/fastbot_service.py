@@ -24,6 +24,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from engine.adb_scan import resolve_adb_binary
 from engine.core.cloud_bridge import CloudBridge
 from engine.core.fastbot import logcat as fastbot_logcat
 from engine.core.fastbot import monkey as fastbot_monkey
@@ -116,7 +117,7 @@ async def run_fastbot_local(
     try:
         # T5：exec 参数数组（不经宿主 shell）；monkey_cmd 整串交设备侧 shell 解释
         monkey_proc = await asyncio.create_subprocess_exec(
-            "adb", "-s", device_serial, "shell", monkey_cmd,
+            resolve_adb_binary(), "-s", device_serial, "shell", monkey_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

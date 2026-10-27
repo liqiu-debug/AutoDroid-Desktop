@@ -9,13 +9,16 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "check": "node --check main.js && node --check preload.js && node --check login_store.js && node --check updater.js",
+    "check": "node --check main.js && node --check preload.js && node --check login_store.js && node --check updater.js && node --check shell_policies.js",
     "check:bridge": "electron tests/electron_bridge_check.js",
     "test:engine": "PY=./.venv/bin/python; if [ ! -x \"$PY\" ]; then PY=python3; fi; $PY -m pytest tests -q",
     "test:smoke": "bash tests/smoke_engine.sh && PY=./.venv/bin/python; if [ ! -x \"$PY\" ]; then PY=python3; fi; $PY tests/smoke_ws.py",
     "dist:engine": "PY=./.venv/bin/python; if [ ! -x \"$PY\" ]; then PY=python3; fi; $PY -m PyInstaller --clean --noconfirm --distpath release-engine --workpath build-engine engine.spec",
+    "predist": "bash scripts/fetch-platform-tools.sh all && bash scripts/check-dist-prereqs.sh all",
     "dist": "electron-builder --win --mac",
+    "predist:win": "bash scripts/fetch-platform-tools.sh windows && bash scripts/check-dist-prereqs.sh windows",
     "dist:win": "electron-builder --win",
+    "predist:mac": "bash scripts/fetch-platform-tools.sh darwin && bash scripts/check-dist-prereqs.sh darwin",
     "dist:mac": "electron-builder --mac"
   },
   "devDependencies": {
@@ -33,6 +36,7 @@
     "files": [
       "*.js",
       "assets/**/*",
+      "!assets/platform-tools/**",
       "engine/**/*.py",
       "package.json"
     ],
@@ -55,11 +59,23 @@
         "from": "assets",
         "to": "assets",
         "filter": [
-          "**/*"
+          "**/*",
+          "!platform-tools",
+          "!platform-tools/**/*"
         ]
       }
     ],
     "win": {
+      "extraResources": [
+        {
+          "from": "assets/platform-tools/windows",
+          "to": "platform-tools",
+          "filter": [
+            "**/*.exe",
+            "**/*.dll"
+          ]
+        }
+      ],
       "target": [
         {
           "target": "nsis",
@@ -77,6 +93,17 @@
       "shortcutName": "AutoDroid"
     },
     "mac": {
+      "extraResources": [
+        {
+          "from": "assets/platform-tools/darwin",
+          "to": "platform-tools",
+          "filter": [
+            "**/*",
+            "!**/*.exe",
+            "!**/*.dll"
+          ]
+        }
+      ],
       "target": [
         {
           "target": "dmg",

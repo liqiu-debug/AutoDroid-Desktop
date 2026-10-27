@@ -13,6 +13,7 @@ const path = require('node:path')
 
 const loginStore = require('../login_store')
 const updater = require('../updater')
+const shellPolicies = require('../shell_policies')
 
 const failures = []
 
@@ -313,6 +314,266 @@ app.whenReady().then(async () => {
     `window.desktop.installUpdate({url: '${base}/redirect', fileName: 'redirect.exe', version: '1.2.3'}).then(() => 'OK', (e) => 'ERR:' + e.message)`
   )
   check('302 重定向跟随下载成功', redirectResult === 'OK', String(redirectResult))
+
+  // ==================== 壳策略（C1/C2/C3：reload / beforeunload 逃生口 / 引擎自动重启） ====================
+
+  // 7a. Cmd/Ctrl+R 判定
+  check('Cmd+R 判定为重新加载', shellPolicies.isReloadShortcut({ key: 'r', meta: true }) === true)
+  check('Ctrl+R 判定为重新加载', shellPolicies.isReloadShortcut({ key: 'r', ctrl: true }) === true)
+  check('大写 R 同样命中', shellPolicies.isReloadShortcut({ key: 'R', ctrl: true }) === true)
+  check('Ctrl+Shift+R（强制刷新变体）命中', shellPolicies.isReloadShortcut({ key: 'r', ctrl: true, shift: true }) === true)
+  check('无修饰键的 R 不命中', shellPolicies.isReloadShortcut({ key: 'r' }) === false)
+  check('Alt+Ctrl+R 不命中', shellPolicies.isReloadShortcut({ key: 'r', ctrl: true, alt: true }) === false)
+  check('Ctrl+Q 不命中', shellPolicies.isReloadShortcut({ key: 'q', ctrl: true }) === false)
+  check('空输入不命中', shellPolicies.isReloadShortcut(null) === false)
+
+  // 7b. will-prevent-unload 确认框分支：取消=保留页面 / 确认=强制重载
+  let unloadDialogOptions = null
+  let unloadChoice = 0
+  const fakeDialog = {
+    showMessageBoxSync(win, options) {
+      unloadDialogOptions = options
+      return unloadChoice
+    },
+  }
+  unloadChoice = 0
+  check('unload 确认框选「取消」→ 不强制重载', shellPolicies.shouldForceReloadAfterUnloadGuard(fakeDialog, win) === false)
+  unloadChoice = 1
+  check('unload 确认框选「重新加载」→ 强制重载', shellPolicies.shouldForceReloadAfterUnloadGuard(fakeDialog, win) === true)
+  check(
+    'unload 确认框文案含未保存提示',
+    !!unloadDialogOptions && /未保存/.test(unloadDialogOptions.message),
+    JSON.stringify(unloadDialogOptions)
+  )
+  check(
+    'unload 确认框按钮取消在前、默认/取消指针在取消',
+    !!unloadDialogOptions &&
+      unloadDialogOptions.buttons.join(',') === '取消,重新加载' &&
+      unloadDialogOptions.defaultId === 0 &&
+      unloadDialogOptions.cancelId === 0,
+    JSON.stringify(unloadDialogOptions)
+  )
+
+  // 7c. 引擎自动重启退避序列 1s→2s→4s→8s→16s→30s（封顶）与次数上限
+  const delays = [1, 2, 3, 4, 5, 6, 7].map((n) => shellPolicies.engineRestartDelayMs(n))
+  check(
+    '引擎重启指数退避 1s→2s→4s→8s→16s→30s（封顶）',
+    JSON.stringify(delays.slice(0, 6)) === JSON.stringify([1000, 2000, 4000, 8000, 16000, 30000]) && delays[6] === 30000,
+    JSON.stringify(delays)
+  )
+  check('重启第 1-5 次允许自动重试', [0, 1, 2, 3, 4, 5].every((n) => shellPolicies.shouldRetryEngineRestart(n) === true))
+  check('重启达到上限后不再自动重试', shellPolicies.shouldRetryEngineRestart(6) === false)
+  check(
+    '稳定运行 30s 后才清失败计数',
+    shellPolicies.isEngineRunStable(29999) === false && shellPolicies.isEngineRunStable(30000) === true
+  )
+
+  // 7d. 壳接线自检（静态）：main.js 必须挂上 reload 逃生口 / unload 确认 / 引擎自动重启
+  const mainSrc = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf-8')
+  check('main.js 挂接 will-prevent-unload', mainSrc.includes("'will-prevent-unload'"))
+  check('main.js 挂接 before-input-event', mainSrc.includes("'before-input-event'"))
+  check('main.js 设置应用菜单（视图→重新加载）', mainSrc.includes('Menu.setApplicationMenu') && mainSrc.includes('重新加载'))
+  check(
+    'main.js 引擎意外退出自动重启',
+    mainSrc.includes('runEngineRestart') && mainSrc.includes('engineRestartDelayMs') && mainSrc.includes('handleEngineUnexpectedExit')
+  )
+
+  // 7e. F3：will-prevent-unload 文案按场景区分（重载/退出）
+  const reloadOpts = shellPolicies.getUnloadGuardDialogOptions('reload')
+  const quitOpts = shellPolicies.getUnloadGuardDialogOptions('quit')
+  check(
+    '重载场景文案：确定重新加载 + 按钮取消/重新加载',
+    /确定重新加载/.test(reloadOpts.message) && reloadOpts.buttons.join(',') === '取消,重新加载',
+    JSON.stringify(reloadOpts)
+  )
+  check(
+    '退出场景文案：确定退出 + 按钮取消/退出',
+    /确定退出/.test(quitOpts.message) && quitOpts.buttons.join(',') === '取消,退出' && quitOpts.title === '退出',
+    JSON.stringify(quitOpts)
+  )
+  check('未知场景回退重载文案', shellPolicies.getUnloadGuardDialogOptions('unknown').message === reloadOpts.message)
+  unloadChoice = 1
+  check('退出场景选「退出」→ 放行卸载', shellPolicies.shouldForceReloadAfterUnloadGuard(fakeDialog, win, 'quit') === true)
+  check('退出场景确认框按钮为取消/退出', unloadDialogOptions.buttons.join(',') === '取消,退出', JSON.stringify(unloadDialogOptions))
+  unloadChoice = 0
+  check('退出场景选「取消」→ 不放行', shellPolicies.shouldForceReloadAfterUnloadGuard(fakeDialog, win, 'quit') === false)
+
+  // 7f. F2（C3×C2 竞态）：loadURL ERR_ABORTED = 用户取消重载，不计入重启失败
+  check(
+    'ERR_ABORTED（message）判为用户取消重载',
+    shellPolicies.isUserCancelledReloadError(new Error("ERR_ABORTED (-3) loading 'http://127.0.0.1:1/'")) === true
+  )
+  check('ERR_ABORTED（code）判为用户取消重载', shellPolicies.isUserCancelledReloadError({ code: 'ERR_ABORTED', message: 'x' }) === true)
+  check('errno -3 判为用户取消重载', shellPolicies.isUserCancelledReloadError({ errno: -3, message: 'x' }) === true)
+  check(
+    '真实失败（ERR_CONNECTION_REFUSED）不判为取消',
+    shellPolicies.isUserCancelledReloadError(new Error('ERR_CONNECTION_REFUSED')) === false
+  )
+  check('空错误不判为取消', shellPolicies.isUserCancelledReloadError(null) === false)
+
+  // 7g. ADB 注入：内置 platform-tools 存在才设 AUTODROID_ADB；已显式设置不覆盖
+  const adbCtx = {
+    isPackaged: true,
+    resourcesPath: '/opt/app/resources',
+    appDir: '/repo',
+    platform: 'darwin',
+    existsSync: () => true,
+  }
+  check(
+    '打包态内置 adb 存在 → 注入 resourcesPath/platform-tools/adb',
+    shellPolicies.applyBundledAdbEnv({}, adbCtx).AUTODROID_ADB === '/opt/app/resources/platform-tools/adb'
+  )
+  check(
+    'Windows 内置 adb 带 .exe',
+    shellPolicies.applyBundledAdbEnv({}, { ...adbCtx, platform: 'win32' }).AUTODROID_ADB ===
+      '/opt/app/resources/platform-tools/adb.exe'
+  )
+  check(
+    '开发态注入分平台目录 assets/platform-tools/darwin/adb',
+    shellPolicies.applyBundledAdbEnv({}, { ...adbCtx, isPackaged: false }).AUTODROID_ADB ===
+      '/repo/assets/platform-tools/darwin/adb'
+  )
+  check(
+    '开发态 Windows 注入 assets/platform-tools/windows/adb.exe',
+    shellPolicies.applyBundledAdbEnv({}, { ...adbCtx, isPackaged: false, platform: 'win32' }).AUTODROID_ADB ===
+      '/repo/assets/platform-tools/windows/adb.exe'
+  )
+  check(
+    '开发态分平台目录缺失 → 回退旧扁平布局 assets/platform-tools/adb',
+    shellPolicies.applyBundledAdbEnv({}, {
+      ...adbCtx,
+      isPackaged: false,
+      existsSync: (p) => String(p).endsWith(path.join('assets', 'platform-tools', 'adb')),
+    }).AUTODROID_ADB === '/repo/assets/platform-tools/adb'
+  )
+  check(
+    '内置 adb 缺失 → 不注入',
+    shellPolicies.applyBundledAdbEnv({}, { ...adbCtx, existsSync: () => false }).AUTODROID_ADB === undefined
+  )
+  check(
+    '已显式设置 AUTODROID_ADB 不覆盖',
+    shellPolicies.applyBundledAdbEnv({ AUTODROID_ADB: '/user/adb' }, adbCtx).AUTODROID_ADB === '/user/adb'
+  )
+
+  // 7h. 壳接线自检（扩展）：F1 记账补排 / F2 ERR_ABORTED 分流 / F3 quitting 复位 / ADB 注入
+  check('main.js 重启在途二次退出记账补排（F1）', mainSrc.includes('enginePendingExitReason'))
+  check('main.js loadURL ERR_ABORTED 分流（F2）', mainSrc.includes('planEngineRestartTeardown'))
+  check('main.js 退出流程取消后复位 quitting（F3）', mainSrc.includes('quitting = false'))
+  check('main.js unload 文案按场景区分（F3）', mainSrc.includes("'quit'"))
+  check('main.js resolveEngineEnv 注入 AUTODROID_ADB', mainSrc.includes('applyBundledAdbEnv(env'))
+
+  // ==================== G1：引擎生命周期竞态（F1 合并补排 / ERR_ABORTED 不连锁 / stale 忽略） ====================
+
+  // 7i. exit 事件分流（纯函数）：stale 子进程迟到退出必须整体忽略——
+  //     不清 engineProcess（抹掉新引擎引用）、不补排重启（制造孤儿引擎）
+  const staleChild = { pid: 101 }
+  const currentChild = { pid: 202 }
+  check(
+    'stale 子进程迟到退出 → 整体忽略',
+    shellPolicies.planEngineExitAction({ child: staleChild, currentProcess: currentChild, settled: true, quitting: false }) === 'ignore-stale'
+  )
+  check(
+    '启动期（未 settle）退出 → 按启动失败收尾、不走意外退出补排',
+    shellPolicies.planEngineExitAction({ child: currentChild, currentProcess: currentChild, settled: false, quitting: false }) === 'startup-failed'
+  )
+  check(
+    '退出流程（quitting）中的退出 → 不排自动重启',
+    shellPolicies.planEngineExitAction({ child: currentChild, currentProcess: currentChild, settled: true, quitting: true }) === 'ignore-quitting'
+  )
+  check(
+    '当前引擎意外退出 → 排自动重启',
+    shellPolicies.planEngineExitAction({ child: currentChild, currentProcess: currentChild, settled: true, quitting: false }) === 'unexpected-exit'
+  )
+
+  // 7j. F1：重启在途二次退出不能丢——失败/二次退出合并成单次补排（同步段内不重复叠排）
+  const tFailOnly = shellPolicies.planEngineRestartTeardown({ startedPort: null, error: new Error('spawn 失败'), pendingReason: null })
+  check(
+    '真实失败 → 续排退避重启',
+    tFailOnly.shouldReschedule === true && tFailOnly.failure === 'spawn 失败' && tFailOnly.reason === '自动重启失败: spawn 失败',
+    JSON.stringify(tFailOnly)
+  )
+  const tPendingOnly = shellPolicies.planEngineRestartTeardown({ startedPort: 8123, error: null, pendingReason: 'code=1 signal=none' })
+  check(
+    '在途二次退出不丢 → 补排一轮',
+    tPendingOnly.shouldReschedule === true && tPendingOnly.userCancelled === false && tPendingOnly.reason === 'code=1 signal=none',
+    JSON.stringify(tPendingOnly)
+  )
+  const tMerged = shellPolicies.planEngineRestartTeardown({ startedPort: null, error: new Error('boom'), pendingReason: 'code=1' })
+  check(
+    '失败+二次退出合并为单次补排、reason 含两者',
+    tMerged.shouldReschedule === true && tMerged.reason === '自动重启失败: boom（期间引擎再次退出: code=1）',
+    JSON.stringify(tMerged)
+  )
+  const tClean = shellPolicies.planEngineRestartTeardown({ startedPort: 8123, error: null, pendingReason: null })
+  check('成功且无二次退出 → 不排重启', tClean.shouldReschedule === false && tClean.reason === null, JSON.stringify(tClean))
+
+  // 7k. F2：ERR_ABORTED（用户取消重载）不连锁重启——引擎已恢复，取消一次不能重启没完
+  const tAborted = shellPolicies.planEngineRestartTeardown({
+    startedPort: 8123,
+    error: new Error("ERR_ABORTED (-3) loading 'http://127.0.0.1:1/'"),
+    pendingReason: null,
+  })
+  check(
+    '用户取消重载 → 不算失败、不连锁重启',
+    tAborted.userCancelled === true && tAborted.failure === null && tAborted.shouldReschedule === false,
+    JSON.stringify(tAborted)
+  )
+  const tAbortedWithPending = shellPolicies.planEngineRestartTeardown({
+    startedPort: 8123,
+    error: { code: 'ERR_ABORTED', message: 'x' },
+    pendingReason: 'code=1',
+  })
+  check(
+    '取消重载期间的二次退出仍补排（只按 pending，不算失败）',
+    tAbortedWithPending.userCancelled === true && tAbortedWithPending.shouldReschedule === true && tAbortedWithPending.reason === 'code=1',
+    JSON.stringify(tAbortedWithPending)
+  )
+  const tRealLoadFail = shellPolicies.planEngineRestartTeardown({
+    startedPort: 8123,
+    error: new Error('ERR_CONNECTION_REFUSED'),
+    pendingReason: null,
+  })
+  check(
+    '真实 loadURL 失败照旧续排',
+    tRealLoadFail.userCancelled === false && tRealLoadFail.failure === 'ERR_CONNECTION_REFUSED' && tRealLoadFail.shouldReschedule === true,
+    JSON.stringify(tRealLoadFail)
+  )
+  check(
+    '未启动成功不算用户取消（startedPort 缺席）',
+    shellPolicies.planEngineRestartTeardown({ startedPort: null, error: new Error("ERR_ABORTED"), pendingReason: null }).userCancelled === false
+  )
+
+  // 7l. G1 接线自检（源码级）：身份校验 / 启动失败丢弃（kill+摘监听）/ quitting 守卫
+  const policiesSrc = fs.readFileSync(path.join(__dirname, '..', 'shell_policies.js'), 'utf-8')
+  check(
+    'main.js exit 处理器走 planEngineExitAction 分流（stale 身份校验）',
+    mainSrc.includes('planEngineExitAction(') && policiesSrc.includes('child !== currentProcess')
+  )
+  check(
+    'main.js 启动失败/超时丢弃子进程（kill + 摘监听）',
+    (mainSrc.match(/discardEngineChild\(child\)/g) || []).length >= 2 &&
+      mainSrc.includes("removeAllListeners('exit')") &&
+      mainSrc.includes("removeAllListeners('error')"),
+    String((mainSrc.match(/discardEngineChild\(child\)/g) || []).length)
+  )
+  const guardIdx = mainSrc.indexOf('function handleEngineUnexpectedExit')
+  check(
+    'main.js handleEngineUnexpectedExit 有 quitting 守卫（退出流程不排重启）',
+    guardIdx >= 0 && mainSrc.slice(guardIdx, guardIdx + 240).includes('if (quitting)')
+  )
+  check(
+    'main.js 重启收尾走 planEngineRestartTeardown（F1 合并补排 / F2 不连锁）',
+    mainSrc.includes('planEngineRestartTeardown(')
+  )
+
+  // 7m. G1 残留：startEngine 顶掉旧引擎前先收尾（kill 旧子进程 + 摘监听），
+  //     否则 runEngineRestart 补排的再次 startEngine 会把旧引用覆盖成孤儿引擎
+  check(
+    'main.js startEngine 顶掉旧引擎前先 kill 旧子进程',
+    /function startEngine[\s\S]{0,900}discardEngineChild\(engineProcess\)/.test(mainSrc) &&
+      mainSrc.includes("target.kill('SIGKILL')"),
+    'startEngine 入口应先 discardEngineChild(engineProcess)'
+  )
 
   updateServer.close()
 

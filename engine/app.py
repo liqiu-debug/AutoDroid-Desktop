@@ -31,6 +31,7 @@ from engine.adb_scan import scan_devices
 from engine.local_api import router as local_api_router
 from engine.proxy import (
     HOP_BY_HOP,
+    NORMAL_TIMEOUT,
     SENSITIVE_REQUEST_HEADERS,
     apply_headers,
     build_target_url,
@@ -48,8 +49,10 @@ DEFAULT_FRONTEND_DIST = ENGINE_ROOT.parent / "AutoDroid" / "frontend" / "dist"
 SERVER_HEADER = "x-autodroid-server"
 AUTH_FORWARDED_HEADERS = ("authorization", "cookie")
 
-# 上传类请求放宽读超时；普通 API 保持较快失败
-_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
+# 共享 HTTP 客户端默认超时：普通 API 短读超时（快速失败、尽快归还同域连接）。
+# 反代路径按请求形态分级覆盖（流式/上传等长请求见 proxy.pick_request_timeout）；
+# 登录/注册/心跳/设备上报等直接调用均为普通 API，走同一短超时。
+_HTTP_TIMEOUT = NORMAL_TIMEOUT
 
 
 def frontend_dist_dir() -> Path:
@@ -144,7 +147,17 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         from engine.core import runner_service, task_scheduler
 
+        # adb 解析唯一入口：注入 ADBUTILS_ADB_PATH（adbutils/uiautomator2 统一）并用
+        # 解析到的 adb start-server 一次自愈（内置 platform-tools 优先，见 adb_scan）
+        try:
+            from engine import adb_scan
+
+            adb_scan.ensure_server_started()
+        except Exception:
+            logger.warning("adb server 自愈启动失败（设备功能可能不可用）", exc_info=True)
         app.state.device_discovery = {"ts": 0.0, "serials": set()}
+        # 设备发现轮次互斥锁：同一时刻至多一轮扫描/上报（不叠轮）
+        app.state.device_discovery_lock = asyncio.Lock()
         app.state.http = httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=False)
         runner_service.broker.bind_loop(asyncio.get_running_loop())
         # 定时任务本地调度（P3-1）：引擎存活期本地 APScheduler 触发；登录后/周期重拉
@@ -339,24 +352,30 @@ def create_app() -> FastAPI:
         """GET 设备列表前置「节流自愈登记」：本机新插入的 adb 设备自动注册上报，
 
         消除「必须先去设备中心点一键同步，用例编辑器才看得到设备」的体验断点；
-        随后照常反代云端权威列表。同一进程内 10 秒最多扫描/上报一轮。
+        随后照常反代云端权威列表。同一进程内 10 秒最多扫描/上报一轮，
+        轮次加锁不叠轮（慢轮未结束时跳过本轮，直接回列表）。
         """
         upstream = require_upstream()
         if not upstream:
             return _upstream_missing()
         state = app.state.device_discovery
+        discovery_lock = app.state.device_discovery_lock
         now = time.monotonic()
-        if now - state["ts"] >= 10.0:
-            state["ts"] = now
-            try:
-                await _register_local_devices(
-                    app.state.http,
-                    _auth_headers(request),
-                    upstream,
-                    only_new=state["serials"],
-                )
-            except Exception:
-                logger.warning("设备自愈登记失败（不影响列表）", exc_info=True)
+        # 节流窗口 + 轮次锁：有在途轮次（locked）时直接跳过，本轮不叠轮；
+        # 锁内复查窗口，避免等锁期间刚跑完的轮次被重复触发。
+        if now - state["ts"] >= 10.0 and not discovery_lock.locked():
+            async with discovery_lock:
+                if time.monotonic() - state["ts"] >= 10.0:
+                    state["ts"] = time.monotonic()
+                    try:
+                        await _register_local_devices(
+                            app.state.http,
+                            _auth_headers(request),
+                            upstream,
+                            only_new=state["serials"],
+                        )
+                    except Exception:
+                        logger.warning("设备自愈登记失败（不影响列表）", exc_info=True)
         return await proxy_request(app.state.http, request, upstream)
 
     @app.websocket("/ws")

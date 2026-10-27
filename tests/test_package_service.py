@@ -111,6 +111,8 @@ def adb(monkeypatch):
         return outputs[index] if index < len(outputs) else outputs[-1]
 
     monkeypatch.setattr(package_service, "_run_adb_command", _run)
+    # adb 可执行路径经 engine.adb_scan 唯一入口解析（固定假路径，断言 argv 贯通）
+    monkeypatch.setattr("engine.adb_scan.find_adb_path", lambda explicit=None: "/resolved/adb")
     return state
 
 
@@ -128,10 +130,10 @@ def test_install_local_success_shape(bridge, adb):
     assert result["version_code"] == "123"
     assert result["retried_after_uninstall"] is False
 
-    # 本地 adb install（-r -t -d，对齐平台 install_flags）
+    # 本地 adb install（-r -t -d，对齐平台 install_flags）；adb 走 adb_scan 解析路径
     install_calls = [c for c in adb["calls"] if "install" in c]
     assert len(install_calls) == 1
-    assert install_calls[0][:4] == ["adb", "-s", "USB1", "install"]
+    assert install_calls[0][:4] == ["/resolved/adb", "-s", "USB1", "install"]
     assert set(install_calls[0][4:7]) == {"-r", "-t", "-d"}
 
 
@@ -178,6 +180,30 @@ def test_install_requires_serial(bridge, adb):
     assert exc.value.status_code == 400
 
 
+def test_install_missing_adb_maps_to_503_with_chinese_hint(bridge, monkeypatch):
+    """G3：adb 解析失败不得裸抛 FileNotFoundError（会变 500 且指引文案到不了用户）。
+
+    必须映射为 PackageInstallError(统一中文指引, 503)，与原裸 "adb" 回退时期
+    _run_adb_command 的 FileNotFoundError → 503 行为保持一致。
+    """
+    monkeypatch.setattr("engine.adb_scan.find_adb_path", lambda explicit=None: None)
+    with pytest.raises(PackageInstallError) as exc:
+        install_package_local(bridge, 9, "USB1")
+    assert exc.value.status_code == 503
+    assert "未检测到 adb" in str(exc.value)
+    assert "platform-tools" in str(exc.value)
+    assert "内置 adb" in str(exc.value)
+
+
+def test_install_endpoint_missing_adb_returns_503_detail(client, monkeypatch):
+    monkeypatch.setattr("engine.adb_scan.find_adb_path", lambda explicit=None: None)
+    resp = client.post("/api/packages/9/install", json={"serial": "USB1"})
+    assert resp.status_code == 503
+    detail = str(resp.json().get("detail", ""))
+    assert "未检测到 adb" in detail
+    assert "platform-tools" in detail
+
+
 # --------------------------- 端点（TestClient） --------------------------- #
 
 @pytest.fixture()
@@ -205,4 +231,4 @@ def test_install_endpoint_is_local_not_proxied(client, package_cloud, adb):
     # 下载走云端数据面，安装端点本身不被反代
     assert any(r["path"].endswith("/download") for r in package_cloud.requests)
     assert not [r for r in package_cloud.requests if r["path"].endswith("/install")]
-    assert adb["calls"] and adb["calls"][0][0] == "adb"
+    assert adb["calls"] and adb["calls"][0][0] == "/resolved/adb"

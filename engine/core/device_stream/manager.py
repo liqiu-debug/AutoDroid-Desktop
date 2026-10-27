@@ -20,6 +20,7 @@ import queue
 from typing import Any, Dict, Optional, Generator, List, Set
 
 import adbutils
+from engine.adb_scan import ensure_server_started, resolve_adb_binary
 from engine.core.device_agents.protocol import parse_tunnel_serial
 from engine.core.device_transport_metrics import device_transport_metrics
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
@@ -132,6 +133,25 @@ SYNC_NAL_TYPES = frozenset({5, 7, 8})
 # 配合"丢帧后等待关键帧"策略，追赶总是以干净的
 # init 序列（SPS/PPS/IDR）重新开始，不会产生花屏。
 CLIENT_QUEUE_MAXSIZE = 8
+
+# 视频生成器无帧总 deadline（秒）：超过该时长一个包都没等到即结束生成器，
+# 让消费端 next() 不再永久阻塞（占死线程池）。设备静止时 scrcpy 仍会持续
+# 出包；真断流/卡死时 15s 后按流结束处理，由上层决定是否重连。
+VIDEO_STALL_TIMEOUT_SEC = 15.0
+SCRCPY_STALL_TIMEOUT_ENV = "AUTODROID_SCRCPY_STALL_TIMEOUT"
+
+
+def _video_stall_timeout() -> float:
+    """视频生成器无帧 deadline（秒）：环境变量可覆盖，默认 15s。"""
+    raw = (os.environ.get(SCRCPY_STALL_TIMEOUT_ENV) or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            logger.warning("环境变量 %s=%r 非法，回退默认值 %s", SCRCPY_STALL_TIMEOUT_ENV, raw, VIDEO_STALL_TIMEOUT_SEC)
+    return VIDEO_STALL_TIMEOUT_SEC
 
 
 class DeviceInfo:
@@ -279,7 +299,7 @@ def _build_scrcpy_server_command(serial: str, params: Optional[Dict[str, int]] =
         f"max_fps={effective['max_fps']} "
         f"i_frame_interval={effective['i_frame_interval']}"
     )
-    return ["adb", "-s", str(serial), "shell", device_cmd]
+    return [resolve_adb_binary(), "-s", str(serial), "shell", device_cmd]
 
 
 def _collect_h264_nal_types(data: bytes) -> Set[int]:
@@ -593,6 +613,12 @@ class ScrcpyDeviceManager:
         """启动 USB 设备监听守护线程"""
         if self._running:
             return
+        # adb 路径解析唯一入口：注入 ADBUTILS_ADB_PATH（adbutils.track_devices 等
+        # 全部走同一 adb）并 start-server 一次自愈
+        try:
+            ensure_server_started()
+        except Exception as exc:
+            logger.warning("adb 解析/自愈失败（监听仍继续）: %s", exc)
         self._running = True
         self._tracking_thread = threading.Thread(
             target=self._track_devices_loop,
@@ -1099,7 +1125,10 @@ class ScrcpyDeviceManager:
     def get_video_generator(self, serial: str) -> Generator[bytes, None, None]:
         """
         获取指定设备的 H.264 视频流生成器 (支持多客户端)。
-        
+
+        无帧总 deadline：超过 _video_stall_timeout() 秒没等到任何包即结束
+        生成器（不再继续空转），让消费端 next() 不会永久阻塞。
+
         Yields:
             bytes: 纯 H.264 NAL 单元数据
         """
@@ -1118,14 +1147,23 @@ class ScrcpyDeviceManager:
         dev_info.input_queues.append(client_queue)
         logger.info(f"客户端加入视频流: {serial} (当前客户端数: {len(dev_info.input_queues)})")
 
+        stall_timeout = _video_stall_timeout()
+        last_packet_at = time.monotonic()
         try:
             while self._running and serial in self._devices and dev_info.ready:
                 try:
                     # 从队列获取帧，设置超时以便检测连接状态
                     data = client_queue.get(timeout=0.1)
+                    last_packet_at = time.monotonic()
                     yield data
                 except queue.Empty:
                     if not dev_info.ready:
+                        break
+                    # 无帧总 deadline：断流/卡死时结束生成器，避免 next() 永久阻塞
+                    if time.monotonic() - last_packet_at >= stall_timeout:
+                        logger.warning(
+                            "视频流 %.1fs 无帧，结束生成器: serial=%s", stall_timeout, serial
+                        )
                         break
                     continue
         finally:

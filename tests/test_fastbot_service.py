@@ -92,6 +92,8 @@ def fake_collection(monkeypatch):
     monkeypatch.setattr(fastbot_logcat, "_monitor_logcat", _monitor_logcat)
     monkeypatch.setattr(fastbot_perf, "_monitor_performance", _monitor_performance)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _create_subprocess_exec)
+    # adb 可执行路径走 adb_scan 唯一入口解析（此处固定假路径，断言 argv[0] 贯通）
+    monkeypatch.setattr("engine.adb_scan.find_adb_path", lambda explicit=None: "/resolved/adb")
     return calls
 
 
@@ -118,9 +120,10 @@ def test_run_fastbot_local_light_profile_report_shape(fake_collection):
     assert summary["performance_monitor_enabled"] is True
     # 未覆盖能力如实标注降级，不伪造数据
     assert set(summary["degraded"]) == {"jank_frame_monitor", "local_replay", "perfetto"}
-    # T5：monkey 走 create_subprocess_exec 参数数组（serial 独立 argv，不经宿主 shell）
+    # T5：monkey 走 create_subprocess_exec 参数数组（serial 独立 argv，不经宿主 shell）；
+    # adb 可执行路径经 engine.adb_scan 唯一入口解析
     argv = fake_collection["monkey_argv"]
-    assert argv[:4] == ["adb", "-s", "USB1", "shell"]
+    assert argv[:4] == ["/resolved/adb", "-s", "USB1", "shell"]
     assert "com.android.commands.monkey.Monkey" in argv[4]
 
 
@@ -291,8 +294,10 @@ def test_adb_shell_exec_args_no_shell(monkeypatch):
         return _P()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _exec)
+    # adb 可执行路径经 engine.adb_scan 唯一入口解析
+    monkeypatch.setattr("engine.adb_scan.find_adb_path", lambda explicit=None: "/resolved/adb")
     asyncio.run(fastbot_adb._adb_shell("USB1", "getprop ro.build.version.sdk"))
-    assert captured["argv"][:4] == ["adb", "-s", "USB1", "shell"]
+    assert captured["argv"][:4] == ["/resolved/adb", "-s", "USB1", "shell"]
 
     with pytest.raises(ValueError):
         asyncio.run(fastbot_adb._adb_shell("USB1; reboot", "echo hi"))
