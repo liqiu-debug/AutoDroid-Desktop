@@ -25,9 +25,13 @@
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import gzip
+import io
 import json
 import logging
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -197,6 +201,78 @@ async def execute_single_step(request: Request, payload: SingleStepPayload) -> R
     except RecordingError as exc:
         return _error_response(exc)
     return _json_response_with_optional_gzip(request, result)
+
+
+@router.get("/api/devices/{serial}/screenshot")
+async def device_screenshot(serial: str) -> Response:
+    """设备中心「查看截图」本地拦截（Android 本机 adb screencap）。
+
+    契约与平台 backend/api/devices.py get_screenshot 一致：
+    {"base64_img": ..., "image_format": "jpeg"}（预览规格最长边 ≤1280 的 JPEG）。
+    不拦截会反代到云端——云端 adb 看不到本机 USB 设备，报
+    「error: device '<serial>' not found」。iOS 截图依赖 WDA 本地化（遗留项），
+    与 iOS 投屏同策略显式降级。
+    """
+    from engine.adb_scan import resolve_adb_binary
+
+    try:
+        adb = resolve_adb_binary()
+    except FileNotFoundError as exc:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    try:
+        raw = await asyncio.to_thread(_screencap_png, adb, serial)
+    except _DeviceNotAttached as exc:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"{exc}（iOS 截图暂未在桌面端本地化；Android 请检查 USB 连接与调试授权）"},
+        )
+    except Exception as exc:  # noqa: BLE001 - 统一转可读错误
+        logger.warning("本地截图失败: serial=%s error=%s", serial, exc)
+        return JSONResponse(status_code=500, content={"detail": f"截图失败: {exc}"})
+
+    try:
+        base64_img, image_format = await asyncio.to_thread(_to_preview_jpeg, raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("截图预览压缩失败: serial=%s error=%s", serial, exc)
+        return JSONResponse(status_code=500, content={"detail": f"截图处理失败: {exc}"})
+
+    return JSONResponse(content={"base64_img": base64_img, "image_format": image_format})
+
+
+class _DeviceNotAttached(RuntimeError):
+    """设备不在本机 adb 清单（或 iOS 未本地化）时抛出，转 404 可读提示。"""
+
+
+def _screencap_png(adb: str, serial: str) -> bytes:
+    """adb exec-out screencap -p 取原始 PNG（exec 数组，不经宿主 shell）。"""
+    try:
+        proc = subprocess.run(
+            [adb, "-s", str(serial), "exec-out", "screencap", "-p"],
+            capture_output=True,
+            timeout=15,
+        )
+    except FileNotFoundError as exc:  # pragma: no cover - resolve 已兜底
+        raise FileNotFoundError(str(exc)) from exc
+    stderr = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+    if proc.returncode != 0 or not proc.stdout:
+        if "not found" in stderr.lower() or "offline" in stderr.lower():
+            raise _DeviceNotAttached(f"设备未连接到本机: {serial}")
+        raise RuntimeError(stderr or f"adb screencap 退出码 {proc.returncode}")
+    return proc.stdout
+
+
+def _to_preview_jpeg(raw: bytes):
+    """预览规格：最长边 ≤1280 的 JPEG q80（与平台 get_screenshot 口径一致）。"""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(raw))
+    image.thumbnail((1280, 1280))
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=80)
+    return base64.b64encode(buffer.getvalue()).decode("ascii"), "jpeg"
 
 
 @router.post("/api/device/crop_template")

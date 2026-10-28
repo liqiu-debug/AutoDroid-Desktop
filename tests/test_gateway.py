@@ -562,3 +562,51 @@ def test_devices_list_discovery_rounds_do_not_overlap(client, mock_upstream, mon
     assert len(results) == 2 and all(r.status_code == 200 for r in results)
     assert counter["calls"] >= 1
     assert counter["max"] == 1, f"发现轮次叠跑了: max={counter['max']}"
+
+
+def test_device_screenshot_local_preview(client, monkeypatch):
+    """设备中心截图走本机 adb（不反代云端）；契约 {base64_img, image_format}。"""
+    import engine.local_api as local_api
+    import base64 as b64
+    from PIL import Image
+    import io as _io
+
+    def fake_png(adb, serial):
+        buf = _io.BytesIO()
+        Image.new("RGB", (2000, 1000), "red").save(buf, format="PNG")
+        return buf.getvalue()
+
+    monkeypatch.setattr(local_api, "_screencap_png", fake_png)
+    monkeypatch.setattr("engine.adb_scan.resolve_adb_binary", lambda: "/resolved/adb")
+    resp = client.get("/api/devices/3B6F/screenshot")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["image_format"] == "jpeg"
+    raw = b64.b64decode(data["base64_img"])
+    img = Image.open(_io.BytesIO(raw))
+    assert max(img.size) <= 1280, "预览规格：最长边 ≤1280"
+
+
+def test_device_screenshot_device_not_attached(client, monkeypatch):
+    import engine.local_api as local_api
+
+    def missing(adb, serial):
+        raise local_api._DeviceNotAttached("设备未连接到本机: X1")
+
+    monkeypatch.setattr(local_api, "_screencap_png", missing)
+    monkeypatch.setattr("engine.adb_scan.resolve_adb_binary", lambda: "/resolved/adb")
+    resp = client.get("/api/devices/X1/screenshot")
+    assert resp.status_code == 404
+    assert "设备未连接到本机" in resp.json()["detail"]
+
+
+def test_device_screenshot_adb_missing_hint(client, monkeypatch):
+    import engine.local_api as local_api
+
+    def no_adb():
+        raise FileNotFoundError("未检测到 adb")
+
+    monkeypatch.setattr("engine.adb_scan.resolve_adb_binary", no_adb)
+    resp = client.get("/api/devices/X1/screenshot")
+    assert resp.status_code == 503
+    assert "adb" in resp.json()["detail"]

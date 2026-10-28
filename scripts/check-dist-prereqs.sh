@@ -65,6 +65,48 @@ check_platform_tools() {
   fail "未找到内置 adb：assets/platform-tools/${platform}/${exe_name}。请先执行 bash scripts/fetch-platform-tools.sh ${platform}（或安装 Android platform-tools 后设置 AUTODROID_ADB）"
 }
 
+# ---------- 4. 新鲜度校验：存在 ≠ 可用 ----------
+# 教训（2026-10-28）：dmg 重建时只跑了 predist，release-engine 里还是旧引擎
+# （含回退裸 "adb" 的旧行为），装包后投屏报 No such file or directory: 'adb'。
+# 源码比产物新 → 拒绝出包，逼重建。
+check_freshness() {
+  local artifact="$1"
+  shift
+  local stale
+  stale=$(find "$@" -type f \( -name "*.py" -o -name "*.spec" -o -name "*.js" -o -name "*.mjs" -o -name "*.vue" -o -name "*.css" -o -name "*.html" -o -name "*.json" \) -newer "${artifact}" 2>/dev/null | head -1)
+  if [ -n "${stale}" ]; then
+    fail "产物过期：${stale} 等源文件比 ${artifact} 新。引擎请先 npm run dist:engine（或 bash scripts/build-mac.sh 全链），前端请在 ../AutoDroid/frontend 执行 npm run build"
+  fi
+}
+
+check_engine_freshness() {
+  local exe_name="autodroid-engine"
+  local bin=""
+  for candidate in \
+    "${REPO_ROOT}/release-engine/autodroid-engine/${exe_name}" \
+    "${REPO_ROOT}/release-engine/${exe_name}" \
+    "${REPO_ROOT}/release-engine/autodroid-engine/${exe_name}.exe" \
+    "${REPO_ROOT}/release-engine/${exe_name}.exe"; do
+    if [ -f "${candidate}" ]; then
+      bin="${candidate}"
+      break
+    fi
+  done
+  if [ -z "${bin}" ]; then
+    return 0  # 存在性校验已报错
+  fi
+  check_freshness "${bin}" "${REPO_ROOT}/engine" "${REPO_ROOT}/engine.spec" "${REPO_ROOT}/engine_entry.py"
+}
+
+check_frontend_freshness() {
+  if [ -f "${FRONTEND_INDEX}" ]; then
+    check_freshness "${FRONTEND_INDEX}" "${REPO_ROOT}/../AutoDroid/frontend/src" "${REPO_ROOT}/../AutoDroid/frontend/package.json"
+  fi
+}
+
+check_engine_freshness
+check_frontend_freshness
+
 if [ "${TARGET}" = "darwin" ] || [ "${TARGET}" = "all" ]; then
   check_engine darwin
   check_platform_tools darwin
