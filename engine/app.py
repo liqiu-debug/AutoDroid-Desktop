@@ -130,9 +130,16 @@ def _serve_static(request: Request) -> Response:
         return JSONResponse(status_code=404, content={"detail": "Not found"})
     if candidate.is_file():
         media_type = mimetypes.guess_type(str(candidate))[0]
-        return FileResponse(candidate, media_type=media_type)
+        # 构建产物带内容 hash，可长缓存
+        return FileResponse(
+            candidate,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
     if index.is_file():
-        return FileResponse(index, media_type="text/html")
+        # index.html 永不缓存：部署新前端后旧壳会因 chunk 名变化导致
+        # 动态 import 失败（点击无响应）——刷新必须拿到新壳
+        return FileResponse(index, media_type="text/html", headers={"Cache-Control": "no-cache"})
     return JSONResponse(
         status_code=404,
         content={"detail": "前端资源不存在（请先构建 frontend 或设置 AUTODROID_FRONTEND_DIST）"},
