@@ -4,6 +4,7 @@
 - GET  /api/client/info     客户端模式标识（云端平台不实现该路由，404 = Web 模式）
 - POST /api/auth/token      读 X-AutoDroid-Server 归一化后设 upstream 并转发
 - POST /api/devices/sync    本机 adb 扫描 → /api/client-devices/register → 回源 /api/devices/
+- GET  /api/devices/        回源云端权威列表 + 本机 adb 在场覆盖假离线（后台自愈登记/补心跳）
 - WS   /ws/* 与 /api/**     反代 upstream（消息双向透传；/api/** 覆盖场景执行 WS）
 - 其余 /api/*               流式反代 upstream（本地设备 I/O 端点见 engine.local_api）
 - 其余路径                   静态托管前端 dist（SPA fallback）
@@ -27,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.websockets import WebSocket
 
 from engine import config_store, presence
-from engine.adb_scan import scan_devices
+from engine.adb_scan import local_serials, scan_devices
 from engine.local_api import router as local_api_router
 from engine.proxy import (
     HOP_BY_HOP,
@@ -53,6 +54,15 @@ AUTH_FORWARDED_HEADERS = ("authorization", "cookie")
 # 反代路径按请求形态分级覆盖（流式/上传等长请求见 proxy.pick_request_timeout）；
 # 登录/注册/心跳/设备上报等直接调用均为普通 API，走同一短超时。
 _HTTP_TIMEOUT = NORMAL_TIMEOUT
+
+# GET 设备列表前置「节流自愈登记」：同一进程内 10 秒至多一轮扫描/上报
+DEVICE_DISCOVERY_INTERVAL_SECONDS = 10.0
+# 本机 adb 在场缓存：后台至多 5s 刷新一次；超过 30s 没刷新成功（adb 卡住/缺失）
+# 视为未知，不再覆盖云端状态
+LOCAL_PRESENCE_REFRESH_SECONDS = 5.0
+LOCAL_PRESENCE_MAX_AGE_SECONDS = 30.0
+# 本机在场却被云端判 OFFLINE 时补发心跳的节流窗口
+PRESENCE_HEAL_INTERVAL_SECONDS = 10.0
 
 
 def frontend_dist_dir() -> Path:
@@ -118,6 +128,28 @@ def _count_online(devices: List[Dict[str, Any]]) -> int:
     return total
 
 
+def overlay_local_presence(devices: List[Dict[str, Any]], local: Optional[set]) -> List[str]:
+    """本机 adb 在场的设备不显示 OFFLINE：就地把 status 翻回 IDLE，返回被翻回的 serial。
+
+    云端对客户端设备只按 last_seen_at 心跳超时判离线；心跳一旦漏跳（隧道抖动、
+    休眠唤醒、adb 瞬时失败）设备就在云端翻成 OFFLINE，而本机投屏/驱动其实都正常，
+    录制页却据此拦截——本机 adb 说在场即在场。只翻 OFFLINE（BUSY/WDA_DOWN 等原样
+    保留）；local 为 None（本机清单未知）时不做覆盖。
+    """
+    if not local:
+        return []
+    revived: List[str] = []
+    for device in devices:
+        serial = str(device.get("serial") or "").strip()
+        if not serial or serial not in local:
+            continue
+        if str(device.get("status") or "").strip().upper() != "OFFLINE":
+            continue
+        device["status"] = "IDLE"
+        revived.append(serial)
+    return revived
+
+
 def _serve_static(request: Request) -> Response:
     """静态托管 dist；未命中的非 /api 路径回退 index.html（SPA 路由）。"""
     dist = frontend_dist_dir()
@@ -162,9 +194,12 @@ def create_app() -> FastAPI:
             adb_scan.ensure_server_started()
         except Exception:
             logger.warning("adb server 自愈启动失败（设备功能可能不可用）", exc_info=True)
-        app.state.device_discovery = {"ts": 0.0, "serials": set()}
+        app.state.device_discovery = {"ts": 0.0, "serials": set(), "task": None}
         # 设备发现轮次互斥锁：同一时刻至多一轮扫描/上报（不叠轮）
         app.state.device_discovery_lock = asyncio.Lock()
+        # 本机 adb 在场缓存（ts=上次刷新成功时刻，attempt_ts=上次尝试时刻）
+        app.state.local_presence = {"ts": 0.0, "attempt_ts": 0.0, "serials": set(), "task": None}
+        app.state.presence_heal = {"ts": 0.0, "task": None}
         app.state.http = httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=False)
         runner_service.broker.bind_loop(asyncio.get_running_loop())
         # 定时任务本地调度（P3-1）：引擎存活期本地 APScheduler 触发；登录后/周期重拉
@@ -183,9 +218,15 @@ def create_app() -> FastAPI:
             yield
         finally:
             # 进程退出/托盘退出（SIGTERM → lifespan shutdown）时 best-effort
-            # 把本客户端设备置 OFFLINE，再停心跳、关设备流、关 HTTP 客户端。
+            # 把本实例登记的设备置 OFFLINE，再停心跳、关设备流、关 HTTP 客户端。
+            for background in (app.state.device_discovery, app.state.local_presence, app.state.presence_heal):
+                task = background.get("task")
+                if task is not None and not task.done():
+                    task.cancel()
             try:
-                await presence.logout_once(app.state.http)
+                await presence.logout_once(
+                    app.state.http, client_instance_id=config_store.get_client_instance_id()
+                )
             except Exception:
                 logger.warning("退出 logout 上报失败", exc_info=True)
             presence.stop_heartbeat_loop()
@@ -353,37 +394,135 @@ def create_app() -> FastAPI:
             }
         )
 
+    async def _run_device_discovery(auth_headers: Dict[str, str], upstream: str) -> None:
+        state = app.state.device_discovery
+        lock = app.state.device_discovery_lock
+        if lock.locked():
+            return
+        async with lock:
+            try:
+                await _register_local_devices(
+                    app.state.http, auth_headers, upstream, only_new=state["serials"]
+                )
+            except Exception:
+                logger.warning("设备自愈登记失败（不影响列表）", exc_info=True)
+
+    def _schedule_device_discovery(auth_headers: Dict[str, str], upstream: str) -> None:
+        """节流 + 不叠轮地在后台跑一轮本机新设备登记（不阻塞列表请求）。
+
+        以前这轮扫描跑在 GET 请求路径里：投屏模式下列表是 2s 级轮询，每 10s 就有
+        一次请求要等完整 adb 属性扫描（6 次往返）才回列表，既拖慢轮询又加重设备上
+        的 adb 负载。改为后台任务后本次响应不含刚登记的新设备，下一轮轮询即可见。
+        """
+        state = app.state.device_discovery
+        lock = app.state.device_discovery_lock
+        if time.monotonic() - state["ts"] < DEVICE_DISCOVERY_INTERVAL_SECONDS or lock.locked():
+            return
+        task = state.get("task")
+        if task is not None and not task.done():
+            return
+        state["ts"] = time.monotonic()
+        state["task"] = asyncio.create_task(_run_device_discovery(auth_headers, upstream))
+
+    async def _refresh_local_presence() -> None:
+        state = app.state.local_presence
+        try:
+            found = await asyncio.to_thread(local_serials)
+        except Exception:
+            logger.warning("本机 adb 在场清单刷新失败", exc_info=True)
+            found = None
+        if found is None:
+            # 失败不前进 ts：超过 LOCAL_PRESENCE_MAX_AGE_SECONDS 自动降级为「未知」
+            return
+        state["serials"] = set(found)
+        state["ts"] = time.monotonic()
+
+    def _schedule_local_presence_refresh() -> None:
+        """后台刷新本机 adb 在场缓存（轻量 `adb devices`，至多 5s 一次、不叠跑）。"""
+        state = app.state.local_presence
+        task = state.get("task")
+        if task is not None and not task.done():
+            return
+        if time.monotonic() - state["attempt_ts"] < LOCAL_PRESENCE_REFRESH_SECONDS:
+            return
+        state["attempt_ts"] = time.monotonic()
+        state["task"] = asyncio.create_task(_refresh_local_presence())
+
+    def _local_presence_snapshot() -> Optional[set]:
+        """本机在场 serial 集合；缓存过期（adb 卡住/缺失）返回 None 表示未知。"""
+        state = app.state.local_presence
+        if time.monotonic() - state["ts"] > LOCAL_PRESENCE_MAX_AGE_SECONDS:
+            return None
+        return state["serials"]
+
+    async def _heal_presence(auth_headers: Dict[str, str], serials: List[str]) -> None:
+        try:
+            updated = await presence.heartbeat_once(
+                app.state.http, serials=serials, auth_headers=auth_headers
+            )
+        except Exception:
+            logger.warning("补发心跳失败: %s", serials, exc_info=True)
+            return
+        logger.info("本机在场设备被云端判离线，已补发心跳: serials=%s updated=%s", serials, updated)
+
+    def _schedule_presence_heal(auth_headers: Dict[str, str], serials: List[str]) -> None:
+        """本机在场却被云端判 OFFLINE：节流补发一次心跳，让云端状态自愈（后台）。
+
+        列表覆盖只修本客户端看到的状态；补心跳把云端 last_seen_at 拉回来，其他
+        消费方（Web 端、定时任务选设备）也随之恢复。
+        """
+        state = app.state.presence_heal
+        task = state.get("task")
+        if task is not None and not task.done():
+            return
+        if time.monotonic() - state["ts"] < PRESENCE_HEAL_INTERVAL_SECONDS:
+            return
+        state["ts"] = time.monotonic()
+        state["task"] = asyncio.create_task(_heal_presence(auth_headers, serials))
+
     @app.get("/api/devices/")
     @app.get("/api/devices")
-    async def list_devices_with_discovery(request: Request) -> Response:
-        """GET 设备列表前置「节流自愈登记」：本机新插入的 adb 设备自动注册上报，
+    async def list_devices_with_local_presence(request: Request) -> Response:
+        """GET 设备列表：回源云端权威列表，再用本机 adb 在场覆盖「假离线」。
 
-        消除「必须先去设备中心点一键同步，用例编辑器才看得到设备」的体验断点；
-        随后照常反代云端权威列表。同一进程内 10 秒最多扫描/上报一轮，
-        轮次加锁不叠轮（慢轮未结束时跳过本轮，直接回列表）。
+        - 节流自愈登记（本机新插入的 adb 设备自动 register，消除「必须先去设备中心
+          一键同步，用例编辑器才看得到设备」的断点）改在后台跑；
+        - 云端对客户端设备按心跳超时判 OFFLINE，而投屏/录制都在本机：本机 adb 在场
+          的设备不显示离线（overlay_local_presence），并节流补发心跳让云端自愈。
         """
         upstream = require_upstream()
         if not upstream:
             return _upstream_missing()
-        state = app.state.device_discovery
-        discovery_lock = app.state.device_discovery_lock
-        now = time.monotonic()
-        # 节流窗口 + 轮次锁：有在途轮次（locked）时直接跳过，本轮不叠轮；
-        # 锁内复查窗口，避免等锁期间刚跑完的轮次被重复触发。
-        if now - state["ts"] >= 10.0 and not discovery_lock.locked():
-            async with discovery_lock:
-                if time.monotonic() - state["ts"] >= 10.0:
-                    state["ts"] = time.monotonic()
-                    try:
-                        await _register_local_devices(
-                            app.state.http,
-                            _auth_headers(request),
-                            upstream,
-                            only_new=state["serials"],
-                        )
-                    except Exception:
-                        logger.warning("设备自愈登记失败（不影响列表）", exc_info=True)
-        return await proxy_request(app.state.http, request, upstream)
+        auth_headers = _auth_headers(request)
+        _schedule_device_discovery(auth_headers, upstream)
+        _schedule_local_presence_refresh()
+
+        target = build_target_url(upstream, "/api/devices/", request.url.query)
+        # 需要改写响应体：显式 identity，避免上游压缩后再解压/透传不一致
+        headers = dict(auth_headers)
+        headers["accept-encoding"] = "identity"
+        try:
+            listed = await app.state.http.get(target, headers=headers)
+        except httpx.TimeoutException as exc:
+            logger.warning("上游超时: GET %s -> %s", target, exc)
+            return JSONResponse(status_code=504, content={"detail": f"上游服务器超时: {exc}"})
+        except httpx.HTTPError as exc:
+            logger.warning("上游连接失败: GET %s -> %s", target, exc)
+            return JSONResponse(status_code=502, content={"detail": f"上游服务器连接失败: {exc}"})
+        if listed.status_code // 100 != 2:
+            return passthrough_response(listed)
+        try:
+            data = listed.json()
+        except ValueError:
+            return passthrough_response(listed)
+        devices = _list_devices_payload(data)
+        if devices is None:
+            return passthrough_response(listed)
+
+        revived = overlay_local_presence(devices, _local_presence_snapshot())
+        if revived:
+            _schedule_presence_heal(auth_headers, revived)
+        return JSONResponse(content=data)
 
     @app.websocket("/ws")
     @app.websocket("/ws/{path:path}")

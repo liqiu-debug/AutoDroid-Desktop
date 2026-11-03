@@ -24,6 +24,7 @@ class _MockUpstream:
             {"id": 2, "serial": "MOCK2", "status": "OFFLINE", "platform": "android"},
         ]
         self.register_status = 200
+        self.list_status = 200
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -81,6 +82,9 @@ class _MockUpstream:
                     self.wfile.write(body)
                     return
                 if self.path.startswith("/api/devices"):
+                    if owner.list_status != 200:
+                        self._send(owner.list_status, {"detail": "Not authenticated"})
+                        return
                     self._send(200, owner.devices)
                     return
                 self._send(404, {"detail": "Not found"})
@@ -115,6 +119,9 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
     monkeypatch.delenv("AUTODROID_FRONTEND_DIST", raising=False)
     monkeypatch.setenv("AUTODROID_CLIENT_VERSION", "9.9.9-test")
+    # 本机 adb 在场清单（列表覆盖 / 心跳）默认空集：测试不拉起真实 adb
+    monkeypatch.setattr("engine.app.local_serials", lambda *args, **kwargs: set())
+    monkeypatch.setattr("engine.adb_scan.local_serials", lambda *args, **kwargs: set())
     config_store.reset_for_tests()
     presence.reset_for_tests()
     app = create_app()
@@ -122,6 +129,28 @@ def client(tmp_path, monkeypatch):
         yield test_client
     presence.reset_for_tests()
     config_store.reset_for_tests()
+
+
+def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+    """轮询等待后台任务落地（发现登记 / 补心跳 / 在场缓存刷新都是后台任务）。"""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return bool(predicate())
+
+
+def _warm_local_presence(test_client: TestClient, serials) -> None:
+    """直接预热本机在场缓存（绕开后台刷新的时序）。"""
+    import time
+
+    now = time.monotonic()
+    test_client.app.state.local_presence.update(
+        {"ts": now, "attempt_ts": now, "serials": set(serials)}
+    )
 
 
 def test_client_info(client):
@@ -371,20 +400,26 @@ def test_login_captures_token_and_logout_on_shutdown(tmp_path, monkeypatch, mock
         config = json.loads(config_store.config_path().read_text("utf-8"))
         assert set(config.keys()) <= {"server", "client_instance_id"}
         assert config.get("server") == mock_upstream.base_url
-    # 退出 with 块 = lifespan shutdown → logout_once 被调用
+    # 退出 with 块 = lifespan shutdown → logout_once 被调用，且只置本实例登记的设备
     logouts = [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/logout")]
     assert logouts, "退出时应调用 /api/client-devices/logout"
     assert logouts[-1]["headers"].get("authorization") == "Bearer tok"
+    assert json.loads(logouts[-1]["body"]) == {"client_instance_id": config_store.get_client_instance_id()}
     presence.reset_for_tests()
     config_store.reset_for_tests()
 
 
 def test_heartbeat_loop_reports_online_serials(client, mock_upstream, monkeypatch):
-    """登录成功后心跳循环按周期上报本机在线 serials（带 Bearer token）。"""
+    """登录成功后心跳循环按周期上报本机在线 serials（带 Bearer token）。
+
+    心跳只走轻量 `adb devices`（local_serials），不做属性扫描；serial 排序上报。
+    """
     import time
 
     monkeypatch.setenv("AUTODROID_HEARTBEAT_INTERVAL", "0.05")
-    monkeypatch.setattr("engine.adb_scan.scan_devices", lambda: [{"serial": "USB1"}, {"serial": "USB2"}])
+    monkeypatch.setattr("engine.adb_scan.local_serials", lambda: {"USB2", "USB1"})
+    scans = []
+    monkeypatch.setattr("engine.adb_scan.scan_devices", lambda: scans.append(1) or [])
     resp = client.post(
         "/api/auth/token",
         data={"username": "u", "password": "p"},
@@ -402,6 +437,7 @@ def test_heartbeat_loop_reports_online_serials(client, mock_upstream, monkeypatc
     body = json.loads(beats[-1]["body"])
     assert body["serials"] == ["USB1", "USB2"]
     assert beats[-1]["headers"].get("authorization") == "Bearer tok"
+    assert scans == [], "心跳不得再做全量属性扫描"
 
 
 def test_heartbeat_skipped_without_token(client, mock_upstream):
@@ -445,10 +481,11 @@ def test_heartbeat_once_posts_serials(client, mock_upstream):
 
 
 def test_devices_list_registers_new_local_devices_throttled(client, mock_upstream, monkeypatch):
-    """GET /api/devices/ 节流自愈：本机新插入的设备自动登记后再透传权威列表。
+    """GET /api/devices/ 节流自愈：本机新插入的设备在后台自动登记，列表照常回源。
 
     消除「必须先去设备中心点一键同步，用例编辑器才看得到设备」的体验断点；
-    重复轮询不得重复上报（节流 + 已登记集合去重）。
+    登记跑在后台任务里（不让 2s 级轮询等一轮 adb 扫描），重复轮询不得重复上报
+    （节流 + 已登记集合去重）。
     """
     fake_devices = [
         {
@@ -473,17 +510,23 @@ def test_devices_list_registers_new_local_devices_throttled(client, mock_upstrea
     resp2 = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
     assert resp1.status_code == 200
     assert resp2.status_code == 200
+    assert [d["serial"] for d in resp1.json()] == ["MOCK1", "MOCK2"]
 
-    registers = [
-        r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/register")
-    ]
-    assert len(registers) == 1, "重复轮询不得重复上报"
-    body = json.loads(registers[0]["body"])
+    def registers():
+        return [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/register")]
+
+    assert _wait_until(lambda: len(registers()) >= 1), "后台发现轮次应完成一次登记上报"
+    task = client.app.state.device_discovery["task"]
+    assert _wait_until(lambda: task is not None and task.done())
+    assert len(registers()) == 1, "重复轮询不得重复上报"
+    body = json.loads(registers()[0]["body"])
     assert body["serial"] == "USB9"
     assert body["client_instance_id"]
+    assert body["serial"] in client.app.state.device_discovery["serials"]
 
     lists = [r for r in mock_upstream.requests if r["path"].startswith("/api/devices")]
-    assert len(lists) == 2, "两次 GET 都应照常透传云端权威列表"
+    assert len(lists) == 2, "两次 GET 都应照常回源云端权威列表"
+    assert lists[-1]["headers"].get("authorization") == "Bearer tok"
 
 
 def test_devices_list_discovery_skips_when_round_in_flight(client, mock_upstream, monkeypatch):
@@ -560,8 +603,164 @@ def test_devices_list_discovery_rounds_do_not_overlap(client, mock_upstream, mon
 
     assert not errors, errors
     assert len(results) == 2 and all(r.status_code == 200 for r in results)
-    assert counter["calls"] >= 1
+    # 发现轮次在后台：等它跑完再断言（避免与 lifespan 关闭竞争）
+    assert _wait_until(lambda: counter["calls"] >= 1 and counter["active"] == 0)
+    task = client.app.state.device_discovery["task"]
+    assert _wait_until(lambda: task is not None and task.done())
     assert counter["max"] == 1, f"发现轮次叠跑了: max={counter['max']}"
+
+
+def test_overlay_local_presence_only_flips_offline_local_devices():
+    """本机在场覆盖：只把本机 adb 在场且云端判 OFFLINE 的设备翻回 IDLE。"""
+    from engine.app import overlay_local_presence
+
+    devices = [
+        {"serial": "A", "status": "OFFLINE"},  # 本机在场 → IDLE
+        {"serial": "B", "status": "BUSY"},  # 本机在场但在执行 → 原样
+        {"serial": "C", "status": "OFFLINE"},  # 不在本机 → 原样（真离线）
+        {"serial": "D", "status": "WDA_DOWN"},  # 非 OFFLINE 状态原样
+        {"status": "OFFLINE"},  # 无 serial 跳过
+    ]
+    revived = overlay_local_presence(devices, {"A", "B", "D"})
+    assert revived == ["A"]
+    assert [d.get("status") for d in devices] == ["IDLE", "BUSY", "OFFLINE", "WDA_DOWN", "OFFLINE"]
+
+    # 本机清单未知（None）或为空：不做任何覆盖
+    devices = [{"serial": "A", "status": "OFFLINE"}]
+    assert overlay_local_presence(devices, None) == []
+    assert overlay_local_presence(devices, set()) == []
+    assert devices[0]["status"] == "OFFLINE"
+
+
+def test_devices_list_overlays_local_presence_and_heals_cloud(client, mock_upstream):
+    """本机插着、云端心跳超时判 OFFLINE 的设备：列表显示 IDLE，并以请求用户身份补发心跳。
+
+    录制页据 status 拦截录制，而投屏/驱动都在本机——假离线不得再拦住用户；
+    补心跳让云端 last_seen_at 回来，其他消费方（Web 端、定时任务）也随之恢复。
+    """
+    mock_upstream.devices.append({"id": 3, "serial": "MOCK3", "status": "BUSY", "platform": "android"})
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    _warm_local_presence(client, {"MOCK2", "MOCK3"})
+
+    resp = client.get("/api/devices/", headers={"Authorization": "Bearer req-tok"})
+    assert resp.status_code == 200
+    statuses = {d["serial"]: d["status"] for d in resp.json()}
+    assert statuses == {"MOCK1": "IDLE", "MOCK2": "IDLE", "MOCK3": "BUSY"}
+    assert resp.json()[1]["platform"] == "android", "其余字段原样保留"
+
+    def heals():
+        return [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/heartbeat")]
+
+    assert _wait_until(lambda: len(heals()) >= 1), "应补发一次心跳让云端自愈"
+    assert json.loads(heals()[-1]["body"]) == {"serials": ["MOCK2"]}
+    # 以当前请求用户身份上报（请求头的 Authorization），不依赖登录时捕获的 token
+    assert heals()[-1]["headers"].get("authorization") == "Bearer req-tok"
+
+    # 节流：10s 内重复轮询不再重复补心跳
+    client.get("/api/devices/", headers={"Authorization": "Bearer req-tok"})
+    client.get("/api/devices/", headers={"Authorization": "Bearer req-tok"})
+    assert len(heals()) == 1
+
+
+def test_devices_list_keeps_cloud_status_when_local_presence_unknown(client, mock_upstream):
+    """本机在场缓存未知/过期（adb 卡住或缺失）时不覆盖：云端 OFFLINE 原样返回、不补心跳。"""
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    # 缓存 ts=0 → 超过 LOCAL_PRESENCE_MAX_AGE_SECONDS → 视为未知
+    client.app.state.local_presence.update({"ts": 0.0, "serials": {"MOCK2"}})
+
+    resp = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    statuses = {d["serial"]: d["status"] for d in resp.json()}
+    assert statuses == {"MOCK1": "IDLE", "MOCK2": "OFFLINE"}
+    heals = [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/heartbeat")]
+    assert not heals
+
+
+def test_devices_list_warms_local_presence_in_background(client, mock_upstream, monkeypatch):
+    """首轮 GET 只触发后台刷新（本次按云端状态返回），缓存就绪后下一轮即覆盖假离线。"""
+    monkeypatch.setattr("engine.app.local_serials", lambda: {"MOCK2"})
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+
+    first = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
+    assert first.status_code == 200
+    assert _wait_until(lambda: client.app.state.local_presence["serials"] == {"MOCK2"})
+
+    second = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
+    statuses = {d["serial"]: d["status"] for d in second.json()}
+    assert statuses["MOCK2"] == "IDLE"
+
+
+def test_devices_list_passes_through_upstream_error_status(client, mock_upstream):
+    """云端非 2xx（如会话过期 401）原样透传：前端据此走会话过期处理。"""
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    mock_upstream.list_status = 401
+    resp = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Not authenticated"}
+
+
+def test_devices_list_forwards_query_string(client, mock_upstream):
+    """设备中心的 refresh_ios_wda 等查询参数原样回源。"""
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    resp = client.get("/api/devices/?refresh_ios_wda=true", headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    lists = [r for r in mock_upstream.requests if r["path"].startswith("/api/devices")]
+    assert lists[-1]["path"] == "/api/devices/?refresh_ios_wda=true"
+
+
+def test_heartbeat_once_uses_light_local_serials(client, mock_upstream, monkeypatch):
+    """heartbeat_once 缺省 serials 走轻量 local_serials：adb 不可用跳过、空清单不发、有设备排序上报。"""
+    import asyncio
+
+    import httpx
+
+    config_store.set_upstream(mock_upstream.base_url)
+    presence.set_token("tok")
+    scans = []
+    monkeypatch.setattr("engine.adb_scan.scan_devices", lambda: scans.append(1) or [])
+
+    async def run():
+        async with httpx.AsyncClient() as http:
+            return await presence.heartbeat_once(http)
+
+    def beats():
+        return [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/heartbeat")]
+
+    try:
+        monkeypatch.setattr("engine.adb_scan.local_serials", lambda: None)
+        assert asyncio.run(run()) is None
+        assert not beats(), "adb 清单不可用时不上报"
+
+        monkeypatch.setattr("engine.adb_scan.local_serials", lambda: set())
+        assert asyncio.run(run()) == 0
+        assert not beats(), "空清单不上报"
+
+        monkeypatch.setattr("engine.adb_scan.local_serials", lambda: {"USB2", "USB1"})
+        assert asyncio.run(run()) == 1
+        assert json.loads(beats()[-1]["body"]) == {"serials": ["USB1", "USB2"]}
+    finally:
+        presence.clear_token()
+    assert scans == [], "心跳不得做全量属性扫描"
 
 
 def test_device_screenshot_local_preview(client, monkeypatch):
