@@ -2,7 +2,13 @@
 
 契约（backend/api/client_devices.py）：
 - POST {upstream}/api/client-devices/heartbeat  {serials: [...]}  刷新 last_seen_at
-- POST {upstream}/api/client-devices/logout     {serials?: [...]} 设备置 OFFLINE
+- POST {upstream}/api/client-devices/logout     {serials?: [...], client_instance_id?: str}
+  设备置 OFFLINE（带 client_instance_id 时只置本实例登记的设备）
+
+心跳只需要 serial 清单：走轻量 `adb devices`（adb_scan.local_serials，一次命令、
+10s 超时），不读属性——云端判离线窗口只有 3 个心跳周期，心跳前跑全量属性扫描
+（getprop/wm size/dumpsys，adbutils 默认 600s socket 超时）在设备被投屏/录制
+挤占时会拖慢甚至卡住心跳，把插着的设备误判离线。
 
 安全红线：token 只驻留内存（auth 登录响应里摘出），绝不落盘；
 upstream 缺失或 token 缺失时整条链路静默跳过（不影响反代主链路）。
@@ -70,29 +76,49 @@ async def _post_json(
     path: str,
     payload: Dict[str, Any],
     timeout: float = 10.0,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Optional[httpx.Response]:
     url = f"{upstream.rstrip('/')}{path}"
     try:
-        return await http.post(url, json=payload, headers=_auth_headers(), timeout=timeout)
+        return await http.post(url, json=payload, headers=headers or _auth_headers(), timeout=timeout)
     except httpx.HTTPError as exc:
         logger.warning("设备存活上报失败: %s -> %s", path, exc)
         return None
 
 
-async def heartbeat_once(http: httpx.AsyncClient, serials: Optional[List[str]] = None) -> Optional[int]:
-    """上报一次心跳；返回 updated 计数（失败/跳过返回 None）。"""
+def _local_serials_for_heartbeat() -> Optional[List[str]]:
+    """本机在线 serial 清单（轻量 `adb devices`）；adb 不可用/失败返回 None。"""
+    from engine.adb_scan import local_serials
+
+    found = local_serials()
+    if found is None:
+        return None
+    return sorted(str(s).strip() for s in found if str(s).strip())
+
+
+async def heartbeat_once(
+    http: httpx.AsyncClient,
+    serials: Optional[List[str]] = None,
+    auth_headers: Optional[Dict[str, str]] = None,
+) -> Optional[int]:
+    """上报一次心跳；返回 updated 计数（失败/跳过返回 None）。
+
+    auth_headers 显式传入时以其代替内存 token（列表自愈补心跳：以当前请求
+    用户身份上报，不依赖登录时是否捕获到 token）。
+    """
     upstream = config_store.get_upstream()
-    if not upstream or not get_token():
+    if not upstream or not (auth_headers or get_token()):
         return None
     if serials is None:
-        from engine.adb_scan import scan_devices
-
-        infos = await asyncio.to_thread(scan_devices)
-        serials = [str(info.get("serial") or "").strip() for info in infos]
-        serials = [s for s in serials if s]
+        serials = await asyncio.to_thread(_local_serials_for_heartbeat)
+        if serials is None:
+            logger.warning("本机 adb 清单不可用，跳过本次心跳")
+            return None
     if not serials:
         return 0
-    resp = await _post_json(http, upstream, "/api/client-devices/heartbeat", {"serials": serials})
+    resp = await _post_json(
+        http, upstream, "/api/client-devices/heartbeat", {"serials": serials}, headers=auth_headers
+    )
     if resp is None or resp.status_code // 100 != 2:
         if resp is not None:
             logger.warning("心跳被拒: status=%s body=%s", resp.status_code, resp.text[:200])
@@ -105,12 +131,23 @@ async def heartbeat_once(http: httpx.AsyncClient, serials: Optional[List[str]] =
     return int(updated) if isinstance(updated, int) else None
 
 
-async def logout_once(http: httpx.AsyncClient, serials: Optional[List[str]] = None) -> None:
-    """退出/进程停止时把本客户端设备置 OFFLINE（best-effort）。"""
+async def logout_once(
+    http: httpx.AsyncClient,
+    serials: Optional[List[str]] = None,
+    client_instance_id: Optional[str] = None,
+) -> None:
+    """退出/进程停止时把本客户端设备置 OFFLINE（best-effort）。
+
+    client_instance_id 传入时云端只置本实例登记的设备：同一账号在另一台机器
+    （或本机另一实例）仍在线的设备不受影响，否则会被一并打成离线、直到对方下一次
+    心跳才恢复。
+    """
     upstream = config_store.get_upstream()
     if not upstream or not get_token():
         return
     payload: Dict[str, Any] = {"serials": serials} if serials is not None else {}
+    if client_instance_id:
+        payload["client_instance_id"] = client_instance_id
     resp = await _post_json(http, upstream, "/api/client-devices/logout", payload, timeout=5.0)
     if resp is not None and resp.status_code // 100 != 2:
         logger.warning("logout 上报被拒: status=%s body=%s", resp.status_code, resp.text[:200])
