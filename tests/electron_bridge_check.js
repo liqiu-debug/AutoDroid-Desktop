@@ -27,9 +27,11 @@ function check(name, ok, detail) {
 }
 
 app.whenReady().then(async () => {
-  // 独立 userData，避免污染真实配置
+  // 独立 userData / downloads，避免污染真实配置与「下载」目录
   const tempUserData = fs.mkdtempSync(path.join(os.tmpdir(), 'autodroid-bridge-'))
   app.setPath('userData', tempUserData)
+  const tempDownloads = fs.mkdtempSync(path.join(os.tmpdir(), 'autodroid-downloads-'))
+  app.setPath('downloads', tempDownloads)
 
   loginStore.registerIpc()
 
@@ -160,8 +162,33 @@ app.whenReady().then(async () => {
   })
 
   // 本地 127.0.0.1 更新源（安全红线不变，仅本机回环）：分块慢发保证产生 downloading 进度事件
+  // /flaky：首次连接发一半就掐断（模拟隧道 ~100s 截断），带 Range 的续传请求补齐剩余字节
+  const flakyTotal = 192 * 1024
+  let flakyServed = 0
   const updateServer = http.createServer((req, res) => {
     const urlPath = String(req.url || '').split('?')[0]
+    if (urlPath === '/flaky') {
+      const rangeHeader = String(req.headers.range || '')
+      const match = /^bytes=(\d+)-/.exec(rangeHeader)
+      const start = match ? Number(match[1]) : 0
+      const body = Buffer.alloc(flakyTotal, 9)
+      if (!match) {
+        // 首次：只发一半后强制断开（客户端按不完整处理并续传）
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(flakyTotal) })
+        res.write(body.subarray(0, Math.floor(flakyTotal / 2)))
+        setTimeout(() => res.destroy(), 30)
+        return
+      }
+      flakyServed += 1
+      const chunk = body.subarray(start)
+      res.writeHead(206, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(chunk.length),
+        'Content-Range': `bytes ${start}-${flakyTotal - 1}/${flakyTotal}`,
+      })
+      res.end(chunk)
+      return
+    }
     if (urlPath === '/ok' || urlPath === '/second' || urlPath === '/slow') {
       const total = urlPath === '/slow' ? 512 * 1024 : 256 * 1024
       const body = Buffer.alloc(total, 7)
@@ -314,6 +341,56 @@ app.whenReady().then(async () => {
     `window.desktop.installUpdate({url: '${base}/redirect', fileName: 'redirect.exe', version: '1.2.3'}).then(() => 'OK', (e) => 'ERR:' + e.message)`
   )
   check('302 重定向跟随下载成功', redirectResult === 'OK', String(redirectResult))
+
+  // 6h. 截断续传：首连发一半就断（模拟隧道掐断）→ 自动带 Range 续传补齐，最终文件完整
+  const flakyEventsBefore = JSON.parse(await run('JSON.stringify(window.__updEventsB)')).length
+  const flakyResult = await run(
+    `window.desktop.installUpdate({url: '${base}/flaky', fileName: 'flaky.dmg', version: '1.2.3'}).then(() => 'OK', (e) => 'ERR:' + e.message)`
+  )
+  check('截断下载自动续传后完成', flakyResult === 'OK', String(flakyResult))
+  const flakyFile = path.join(tempUserData, 'updates', 'flaky.dmg')
+  check(
+    '续传后文件完整（192KB）',
+    fs.existsSync(flakyFile) && fs.statSync(flakyFile).size === flakyTotal,
+    fs.existsSync(flakyFile) ? String(fs.statSync(flakyFile).size) : 'missing',
+  )
+  check('续传确实用了 Range 请求', flakyServed >= 1, String(flakyServed))
+  const flakyEvents = JSON.parse(await run('JSON.stringify(window.__updEventsB)')).slice(flakyEventsBefore)
+  check(
+    '续传过程进度单调不减',
+    flakyEvents.filter((e) => e.phase === 'downloading').every((e, i, arr) => i === 0 || e.percent >= arr[i - 1].percent),
+    JSON.stringify(flakyEvents.filter((e) => e.phase === 'downloading')),
+  )
+  check('续传路径不残留 .part', !fs.existsSync(`${flakyFile}.part`))
+
+  // 6i. 新增桥面：checkRelease / getUpdateStatus / applyUpdate / downloadPackage + onDownloadProgress
+  check('checkRelease 已暴露', (await run('typeof window.desktop.checkRelease')) === 'function')
+  check('getUpdateStatus 已暴露', (await run('typeof window.desktop.getUpdateStatus')) === 'function')
+  check('applyUpdate 已暴露', (await run('typeof window.desktop.applyUpdate')) === 'function')
+  check('downloadPackage 已暴露', (await run('typeof window.desktop.downloadPackage')) === 'function')
+  check('onDownloadProgress 已暴露', (await run('typeof window.desktop.onDownloadProgress')) === 'function')
+  const noStaged = await run('window.desktop.getUpdateStatus()')
+  check('无暂存时 getUpdateStatus 返回 staged:null', !!noStaged && noStaged.staged === null, JSON.stringify(noStaged))
+  const applyWithoutStaged = await run(
+    `window.desktop.applyUpdate().then((r) => JSON.stringify(r), (e) => 'ERR:' + e.message)`
+  )
+  check('无暂存时 applyUpdate 明确报错', String(applyWithoutStaged).includes('没有待安装的更新'), String(applyWithoutStaged))
+
+  // 6j. 包管理下载：落「下载」目录 + 下载进度通道
+  await run('window.__dlEvents = []; window.__unsubDl = window.desktop.onDownloadProgress((e) => window.__dlEvents.push(e)); "ok"')
+  const pkgDownload = await run(
+    `window.desktop.downloadPackage({url: '${base}/ok', fileName: 'AutoDroid_1.2.3.dmg'}).then((r) => JSON.stringify(r), (e) => 'ERR:' + e.message)`
+  )
+  check('downloadPackage 返回落盘路径与大小', String(pkgDownload).includes(path.join(tempDownloads, 'AutoDroid_1.2.3.dmg')), String(pkgDownload))
+  check('安装包落到系统「下载」目录且完整', fs.statSync(path.join(tempDownloads, 'AutoDroid_1.2.3.dmg')).size === 256 * 1024)
+  const dlEvents = JSON.parse(await run('JSON.stringify(window.__dlEvents)'))
+  check('downloadPackage 有下载进度事件', dlEvents.some((e) => e.phase === 'downloading'), JSON.stringify(dlEvents))
+  check('downloadPackage 终态 done 带 size', dlEvents.some((e) => e.phase === 'done' && e.size === 256 * 1024), JSON.stringify(dlEvents.slice(-2)))
+  const badPkg = await run(
+    `window.desktop.downloadPackage({url: '${base}/missing', fileName: 'x.dmg'}).then(() => 'NO_REJECT', (e) => 'ERR:' + e.message)`
+  )
+  check('downloadPackage 失败 reject 且报 HTTP 状态', String(badPkg).startsWith('ERR:') && String(badPkg).includes('404'), String(badPkg))
+  await run('window.__unsubDl()')
 
   // ==================== 壳策略（C1/C2/C3：reload / beforeunload 逃生口 / 引擎自动重启） ====================
 
