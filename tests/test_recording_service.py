@@ -66,23 +66,30 @@ def test_localize_step_images_keeps_absolute_paths():
     assert out["args"]["image_path"] == "/already/local.png"
 
 
+_FAKE_HIERARCHY_XML = (
+    '<hierarchy rotation="0"><node bounds="[0,0][100,100]" text="登录" '
+    'resource-id="com.demo:id/login" class="android.widget.Button" content-desc="" '
+    'clickable="true" /></hierarchy>'
+)
+
+
 class _FakeDevice:
     """u2 Device 的最小替身：层级/截图/点击。"""
 
     def __init__(self):
         self.clicked = []
         self.info = {"displayWidth": 1080, "displayHeight": 2400}
+        self.hierarchy_calls = 0
+        self.screenshot_calls = 0
 
     def dump_hierarchy(self):
-        return (
-            '<hierarchy rotation="0"><node bounds="[0,0][100,100]" text="登录" '
-            'resource-id="com.demo:id/login" class="android.widget.Button" content-desc="" '
-            'clickable="true" /></hierarchy>'
-        )
+        self.hierarchy_calls += 1
+        return _FAKE_HIERARCHY_XML
 
     def screenshot(self):
         from PIL import Image
 
+        self.screenshot_calls += 1
         return Image.new("RGB", (1080, 2400), color=(10, 10, 10))
 
     def click(self, x, y):
@@ -111,8 +118,9 @@ def fake_device(monkeypatch):
         "invalidate",
         lambda serial, device=None: None,
     )
-    # 跳过截图哈希轮询（测试里不等待 UI 稳定）
-    monkeypatch.setattr(recording_service, "_wait_ui_stable", lambda *args, **kwargs: None)
+    # 稳定轮询走真实循环，但去掉等待（层级固定的替身设备一轮确认即稳定）
+    monkeypatch.setattr(recording_service, "_get_recording_post_action_delay", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(recording_service, "UI_STABLE_POLL_GAP_SECONDS", 0.0)
     return device
 
 
@@ -163,6 +171,97 @@ def test_interact_device_global_action(fake_device):
     assert "back" in fake_device.clicked
     assert result["step"]["action"] == "back"
     assert "screenshot" not in result["dump"]
+
+
+def test_post_action_dump_reuses_stable_frame(fake_device):
+    """稳定帧即响应 dump：点击后只探测 2 次层级（首帧+确认帧）、截图恰 1 次。
+
+    旧实现每次轮询整图截图、稳定后再补一次 dump（一次点击 ≥3 次整图 + 1 次层级）。
+    """
+    result = recording_service.interact_device(
+        x=50,
+        y=50,
+        operation="click",
+        xml_dump=_FAKE_HIERARCHY_XML,
+        device_serial="USB1",
+        include_screenshot=True,
+        include_device_info=True,
+    )
+    assert fake_device.hierarchy_calls == 2
+    assert fake_device.screenshot_calls == 1
+    assert result["dump"]["hierarchy_xml"] == _FAKE_HIERARCHY_XML
+    assert result["dump"]["screenshot"]
+    assert result["dump"]["device_info"]["displayWidth"] == 1080
+
+
+def test_post_action_dump_waits_until_hierarchy_settles(fake_device, monkeypatch):
+    """界面连续变化时轮询到稳定：返回稳定帧，不稳定轮的截图作废不冒充结果。"""
+
+    class _ChangingHierarchyDevice(_FakeDevice):
+        def __init__(self, stabilize_after: int):
+            super().__init__()
+            self.stabilize_after = stabilize_after
+
+        def dump_hierarchy(self):
+            self.hierarchy_calls += 1
+            if self.hierarchy_calls >= self.stabilize_after:
+                return _FAKE_HIERARCHY_XML
+            return f'<hierarchy rotation="0"><node bounds="[0,0][10,10]" text="第{self.hierarchy_calls}帧" /></hierarchy>'
+
+    device = _ChangingHierarchyDevice(stabilize_after=4)
+    monkeypatch.setattr(recording_service._recording_android_device_pool, "acquire", lambda serial: device)
+    result = recording_service.interact_device(
+        x=50,
+        y=50,
+        operation="click",
+        xml_dump=_FAKE_HIERARCHY_XML,
+        device_serial="USB1",
+        include_screenshot=True,
+        include_device_info=False,
+    )
+    assert result["dump"]["hierarchy_xml"] == _FAKE_HIERARCHY_XML
+    assert device.hierarchy_calls >= 5  # 3 帧变化 + 稳定帧 + 确认帧
+    assert device.screenshot_calls >= 2  # 不稳定轮作废后重拍
+
+
+def test_post_action_dump_network_device_skips_stability_polling(fake_device):
+    """网络设备（ip:port）跳过稳定轮询：单次 dump 直接返回（同既有语义）。"""
+    result = recording_service.interact_device(
+        x=50,
+        y=50,
+        operation="click",
+        xml_dump=_FAKE_HIERARCHY_XML,
+        device_serial="192.168.1.9:5555",
+        include_screenshot=False,
+        include_device_info=False,
+    )
+    assert fake_device.hierarchy_calls == 1
+    assert "screenshot" not in result["dump"]
+
+
+def test_post_action_dump_timeout_uses_last_frame(fake_device, monkeypatch):
+    """持续不稳定（如动画）超时：以最后一帧层级 + 现拍截图兜底，不无限等待。"""
+
+    class _NeverStableDevice(_FakeDevice):
+        def dump_hierarchy(self):
+            self.hierarchy_calls += 1
+            return f'<hierarchy rotation="0"><node bounds="[0,0][10,10]" text="帧{self.hierarchy_calls}" /></hierarchy>'
+
+    device = _NeverStableDevice()
+    monkeypatch.setattr(recording_service._recording_android_device_pool, "acquire", lambda serial: device)
+    monkeypatch.setattr(recording_service, "UI_STABLE_TIMEOUT_SECONDS", 0.05)
+    result = recording_service.interact_device(
+        x=50,
+        y=50,
+        operation="click",
+        xml_dump=_FAKE_HIERARCHY_XML,
+        device_serial="USB1",
+        include_screenshot=True,
+        include_device_info=False,
+    )
+    assert "帧" in result["dump"]["hierarchy_xml"]  # 最后一帧
+    assert result["dump"]["screenshot"]
+    assert device.screenshot_calls >= 1
 
 
 def test_interact_ios_rejected():

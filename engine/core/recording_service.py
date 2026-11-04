@@ -229,41 +229,110 @@ def _get_recording_post_action_delay(platform: str, operation: str) -> float:
     return 0.2
 
 
-def _screenshot_hash(device) -> str:
-    image = device.screenshot()
-    if isinstance(image, (bytes, bytearray)):
-        raw = bytes(image)
-    else:
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        raw = buf.getvalue()
-    return hashlib.md5(raw).hexdigest()
+# 点击后「等 UI 稳定」的窗口与轮询间隔：以层级哈希为稳定信号。
+# 旧实现每次轮询都做整图截图（screencap，0.5~1s/次），稳定后还要再 dump 一次层级——
+# 一次点击至少 3 次设备往返。层级 dump 本就是下一步解析元素的必需数据：拿它做稳定
+# 信号后，稳定帧即最终 dump，且静态模式的截图与确认帧并行，不占额外挂钟。
+UI_STABLE_TIMEOUT_SECONDS = 3.0
+UI_STABLE_POLL_GAP_SECONDS = 0.12
+# 操作后 dump 的截图与确认帧并行用；截图只在确认稳定的那一轮被采纳（不稳定轮作废）
+_POST_ACTION_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="recording-post-action")
 
 
-def _wait_ui_stable(
+def _assemble_post_action_dump(
+    hierarchy_payload: Optional[Dict[str, Any]],
     device,
     platform: str,
+    serial: Optional[str],
+    include_screenshot: bool,
+    include_device_info: bool,
+    screenshot_future=None,
+) -> Dict[str, Any]:
+    """组装操作后的 dump 响应：层级帧 + 可选设备信息 + 可选截图。
+
+    screenshot_future 有值（确认帧并行拍的截图）时优先采用；失败/缺省时现拍一张。
+    """
+    payload: Dict[str, Any] = dict(hierarchy_payload or {})
+    if include_device_info:
+        payload["device_info"] = _get_device_info_payload(device, platform=platform, serial=serial)
+    if not include_screenshot:
+        return payload
+    if screenshot_future is not None:
+        try:
+            screenshot_b64, screenshot_format = screenshot_future.result(timeout=UI_STABLE_TIMEOUT_SECONDS)
+        except Exception:
+            logger.warning("稳定帧截图失败，现拍一张", exc_info=True)
+        else:
+            payload["screenshot"] = screenshot_b64
+            payload["screenshot_format"] = screenshot_format
+            return payload
+    screenshot_b64, screenshot_format = _take_screenshot_payload(device, serial)
+    payload["screenshot"] = screenshot_b64
+    payload["screenshot_format"] = screenshot_format
+    return payload
+
+
+def _post_action_dump_payload(
+    device,
+    platform: str,
+    serial: Optional[str],
     operation: str,
-    timeout: float = 3.0,
-    serial: Optional[str] = None,
-) -> None:
-    """等待设备 UI 稳定（同上游语义：最小延迟 + 截图哈希轮询；网络设备跳过轮询）。"""
-    min_delay = _get_recording_post_action_delay(platform, operation)
-    time.sleep(min_delay)
+    include_screenshot: bool = True,
+    include_device_info: bool = True,
+) -> Dict[str, Any]:
+    """执行操作后等 UI 稳定并返回新 dump（稳定层级帧即响应 dump）。
+
+    网络设备（serial 为 ip:port）跳过稳定轮询，直接单次 dump（同既有语义）；
+    轮询超时/异常时以最后一帧层级 + 现拍截图兜底（等价旧实现的「等超时后再 dump」）。
+    """
+    time.sleep(_get_recording_post_action_delay(platform, operation))
 
     if NETWORK_DEVICE_SERIAL_RE.match(str(serial or "")):
-        return
+        return _build_device_dump_payload(
+            device,
+            platform=platform,
+            serial=serial,
+            include_screenshot=include_screenshot,
+            include_device_info=include_device_info,
+        )
 
-    poll_interval = 0.25
-    deadline = time.monotonic() + (timeout - min_delay)
+    deadline = time.monotonic() + UI_STABLE_TIMEOUT_SECONDS
+    try:
+        last_hierarchy = _build_hierarchy_payload(device, platform=platform, serial=serial)
+    except Exception:
+        logger.warning("层级稳定探测失败，回退单次完整 dump", exc_info=True)
+        return _build_device_dump_payload(
+            device,
+            platform=platform,
+            serial=serial,
+            include_screenshot=include_screenshot,
+            include_device_info=include_device_info,
+        )
 
-    prev_hash = _screenshot_hash(device)
+    screenshot_future = None
     while time.monotonic() < deadline:
-        time.sleep(poll_interval)
-        curr_hash = _screenshot_hash(device)
-        if curr_hash == prev_hash:
-            return
-        prev_hash = curr_hash
+        time.sleep(UI_STABLE_POLL_GAP_SECONDS)
+        if include_screenshot and screenshot_future is None:
+            screenshot_future = _POST_ACTION_EXECUTOR.submit(_take_screenshot_payload, device, serial)
+        try:
+            current_hierarchy = _build_hierarchy_payload(device, platform=platform, serial=serial)
+        except Exception:
+            logger.warning("层级稳定探测失败，以最后一帧返回", exc_info=True)
+            screenshot_future = None
+            break
+        last_hash = str(last_hierarchy.get("hierarchy_hash") or "")
+        current_hash = str(current_hierarchy.get("hierarchy_hash") or "")
+        if current_hash and current_hash == last_hash:
+            return _assemble_post_action_dump(
+                current_hierarchy, device, platform, serial,
+                include_screenshot, include_device_info, screenshot_future,
+            )
+        last_hierarchy = current_hierarchy
+        screenshot_future = None  # 界面仍在变：本轮截图作废，下一轮重拍
+
+    return _assemble_post_action_dump(
+        last_hierarchy, device, platform, serial, include_screenshot, include_device_info
+    )
 
 
 def _perform_device_operation(device, platform: str, operation: str, x: int, y: int, action_data: Optional[str]) -> None:
@@ -448,19 +517,13 @@ def interact_device(
 
         _perform_device_operation(device, platform=platform, operation=operation, x=x, y=y, action_data=action_data)
 
-        _wait_ui_stable(
-            device,
-            platform=platform,
-            operation=operation,
-            serial=device_serial,
-        )
-
         return {
             "step": step_info,
-            "dump": _build_device_dump_payload(
+            "dump": _post_action_dump_payload(
                 device,
                 platform=platform,
                 serial=device_serial,
+                operation=operation,
                 include_screenshot=include_screenshot,
                 include_device_info=include_device_info,
             ),
@@ -625,18 +688,13 @@ def execute_single_step(
         )
         step_result = runner.run_step(standard_step)
         dump_device_ = _unwrap_runner_dump_device(runner.driver, platform)
-        _wait_ui_stable(
-            dump_device_,
-            platform=platform,
-            operation=standard_step.get("action", ""),
-            serial=device_serial,
-        )
         return {
             "result": _cross_platform_result_to_legacy_payload(step_result),
-            "dump": _build_device_dump_payload(
+            "dump": _post_action_dump_payload(
                 dump_device_,
                 platform=platform,
                 serial=device_serial,
+                operation=standard_step.get("action", ""),
                 include_screenshot=include_screenshot,
                 include_device_info=include_device_info,
             ),
