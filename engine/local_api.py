@@ -798,7 +798,22 @@ async def run_fastbot_task_local(request: Request, payload: FastbotRunPayload) -
     from engine.core.device_stream.manager import device_manager
 
     device_serial = str(payload.device_serial or "").strip()
-    if not device_manager.get_device(device_serial):
+    from engine.core.fastbot_ios.tools import is_ios_serial, local_ios_serials, udid_from_serial
+
+    if is_ios_serial(device_serial):
+        ios_online = await _to_thread(local_ios_serials)
+        if ios_online is None:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "未检测到 libimobiledevice（brew install libimobiledevice），无法连接 iOS 设备"},
+            )
+        try:
+            udid = udid_from_serial(device_serial)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        if udid not in ios_online:
+            return JSONResponse(status_code=400, content={"detail": "iOS 设备未通过 USB 连接或未信任本机"})
+    elif not device_manager.get_device(device_serial):
         return JSONResponse(status_code=400, content={"detail": "设备不在线或未就绪"})
     bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
     if not bridge.available:

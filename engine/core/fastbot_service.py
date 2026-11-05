@@ -334,6 +334,25 @@ def create_cloud_task(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str,
     return bridge.create_client_fastbot(payload)
 
 
+def _run_ios(*, weights: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+    """iOS 分支：主机驱动 WDA（engine/core/fastbot_ios）；事件权重映射 Android 四档。"""
+    from engine.core.fastbot_ios.monkey import EventWeights
+    from engine.core.fastbot_ios.runner import run_ios_fastbot_local
+
+    event_weights = EventWeights()
+    if weights.get("enable_custom_event_weights"):
+        event_weights = EventWeights(
+            touch=int(weights.get("pct_touch", 40) or 0),
+            motion=int(weights.get("pct_motion", 30) or 0),
+            long_press=10,
+            back=int(weights.get("pct_majornav", 15) or 0),
+            syskeys=int(weights.get("pct_syskeys", 5) or 0),
+        )
+    return run_ios_fastbot_local(
+        bundle_id=kwargs.pop("package_name"), weights=event_weights, **kwargs
+    )
+
+
 def run_and_report(
     *,
     task_id: int,
@@ -363,8 +382,10 @@ def run_and_report(
             "summary": {},
         }
         try:
-            report = asyncio.run(
-                run_fastbot_local(
+            from engine.core.fastbot_ios.tools import is_ios_serial
+
+            if is_ios_serial(device_serial):
+                report = _run_ios(
                     device_serial=device_serial,
                     package_name=package_name,
                     duration=duration,
@@ -372,16 +393,30 @@ def run_and_report(
                     ignore_crashes=ignore_crashes,
                     capture_log=capture_log,
                     enable_performance_monitor=enable_performance_monitor,
-                    enable_custom_event_weights=bool(weights.get("enable_custom_event_weights")),
-                    pct_touch=int(weights.get("pct_touch", 40) or 40),
-                    pct_motion=int(weights.get("pct_motion", 30) or 30),
-                    pct_syskeys=int(weights.get("pct_syskeys", 5) or 5),
-                    pct_majornav=int(weights.get("pct_majornav", 15) or 15),
-                    task_id=task_id,
                     enable_local_replay=enable_local_replay,
+                    weights=weights,
                     report_dir=str(local_report_dir(task_id)),
                 )
-            )
+            else:
+                report = asyncio.run(
+                    run_fastbot_local(
+                        device_serial=device_serial,
+                        package_name=package_name,
+                        duration=duration,
+                        throttle=throttle,
+                        ignore_crashes=ignore_crashes,
+                        capture_log=capture_log,
+                        enable_performance_monitor=enable_performance_monitor,
+                        enable_custom_event_weights=bool(weights.get("enable_custom_event_weights")),
+                        pct_touch=int(weights.get("pct_touch", 40) or 40),
+                        pct_motion=int(weights.get("pct_motion", 30) or 30),
+                        pct_syskeys=int(weights.get("pct_syskeys", 5) or 5),
+                        pct_majornav=int(weights.get("pct_majornav", 15) or 15),
+                        task_id=task_id,
+                        enable_local_replay=enable_local_replay,
+                        report_dir=str(local_report_dir(task_id)),
+                    )
+                )
         except Exception as exc:
             logger.exception("Fastbot 本地执行异常: task=%s device=%s", task_id, device_serial)
             status = "FAILED"
@@ -437,11 +472,15 @@ def start_fastbot_run(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str,
     package_name = str(payload.get("package_name") or "").strip()
     if not device_serial or not package_name:
         raise ValueError("package_name / device_serial 不能为空")
-    if str(device_serial).startswith("ios:"):
-        raise ValueError("Fastbot 仅支持 Android 设备")
-    # T5：入口即白名单校验（HTTP 400 显式拒绝非法 serial/包名）
-    validate_device_serial(device_serial)
-    validate_package_name(package_name)
+    from engine.core.fastbot_ios.tools import is_ios_serial, udid_from_serial
+
+    if is_ios_serial(device_serial):
+        udid_from_serial(device_serial)  # 非法 UDID → ValueError（HTTP 400）
+        validate_package_name(package_name)  # Bundle ID 与包名同字符集
+    else:
+        # T5：入口即白名单校验（HTTP 400 显式拒绝非法 serial/包名）
+        validate_device_serial(device_serial)
+        validate_package_name(package_name)
 
     duration = int(payload.get("duration") or 600)
     throttle = int(payload.get("throttle") or 500)

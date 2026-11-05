@@ -88,9 +88,9 @@ async def _post_json(
 
 def _local_serials_for_heartbeat() -> Optional[List[str]]:
     """本机在线 serial 清单（轻量 `adb devices`）；adb 不可用/失败返回 None。"""
-    from engine.adb_scan import local_serials
+    from engine.device_scan import all_local_serials
 
-    found = local_serials()
+    found = all_local_serials()
     if found is None:
         return None
     return sorted(str(s).strip() for s in found if str(s).strip())
