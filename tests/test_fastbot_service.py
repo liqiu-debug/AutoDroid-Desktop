@@ -3,7 +3,8 @@
 覆盖：
 - vendor monkey 资源目录/命令拼接（assets/fastbot 随客户端分发）
 - run_fastbot_local 轻量档报告六列形状 + 汇总（crash 计数 / 降级标注）
-- run_and_report 收尾上报（client-fastbot finish 载荷形状）
+- 异常回放：滚动录制编排（start/capture/stop）、事件 replay 载荷、产物上传
+- run_and_report 收尾上报（client-fastbot finish 载荷形状 + 回放先上传后收尾）
 - start_fastbot_run：云端登记 + 后台执行入参
 - POST /api/fastbot/run 本地拦截（不反代云端 /api/fastbot/run）+ 未在线设备 400
 - 平台 client-fastbot 契约字段漂移锁（AST，无需导入平台依赖栈）
@@ -21,6 +22,7 @@ import pytest
 
 from engine import config_store, presence
 from engine.core import cloud_bridge, fastbot_service
+from engine.core.device_stream import recorder as device_recorder
 from engine.core.fastbot import logcat as fastbot_logcat
 from engine.core.fastbot import monkey as fastbot_monkey
 from engine.core.fastbot import perf_monitor as fastbot_perf
@@ -74,9 +76,14 @@ def fake_collection(monkeypatch):
         return ""
 
     async def _monitor_logcat(serial, package, stop_event, crash_events, capture_log, **kwargs):
-        crash_events.append(
-            {"type": "CRASH", "time": "t", "package": package, "message": "boom"}
-        )
+        calls["logcat_kwargs"] = dict(kwargs)
+        event = {"type": "CRASH", "time": "t", "package": package, "message": "boom"}
+        replay_callback = kwargs.get("replay_callback")
+        if replay_callback:
+            replay = await replay_callback("CRASH", "t")
+            if replay:
+                event["replay"] = replay
+        crash_events.append(event)
         await stop_event.wait()
 
     async def _monitor_performance(serial, package, stop_event, perf_data, interval=10):
@@ -127,6 +134,195 @@ def test_run_fastbot_local_light_profile_report_shape(fake_collection):
     assert "com.android.commands.monkey.Monkey" in argv[4]
 
 
+# --------------------------- 异常回放（本地滚动录制） --------------------------- #
+
+@pytest.fixture()
+def fake_recorder(monkeypatch):
+    """device_manager 录制替身：记录 start/capture/stop 入参，capture 返回就绪产物。"""
+    from engine.core.device_stream.manager import device_manager
+
+    calls: Dict[str, Any] = {}
+
+    def _start(serial, task_id, report_dir, pre_roll_sec=30, post_roll_sec=5, segment_sec=5):
+        calls["start"] = {
+            "serial": serial,
+            "task_id": task_id,
+            "report_dir": report_dir,
+            "pre_roll_sec": pre_roll_sec,
+            "post_roll_sec": post_roll_sec,
+            "segment_sec": segment_sec,
+        }
+        return object()
+
+    def _capture(serial, event_type, event_time):
+        calls.setdefault("capture", []).append((serial, event_type, event_time))
+        return device_recorder.ReplayCaptureResult(
+            status="READY",
+            path="../../relative/local/path/crash_t_01.mp4",
+            filename="crash_t_01.mp4",
+            pre_roll_sec=30,
+            post_roll_sec=5,
+            duration_sec=35,
+        )
+
+    def _stop(serial):
+        calls.setdefault("stop", []).append(serial)
+
+    monkeypatch.setattr(device_manager, "start_recording", _start)
+    monkeypatch.setattr(device_manager, "capture_replay", _capture)
+    monkeypatch.setattr(device_manager, "stop_recording", _stop)
+    return calls
+
+
+def _run_local(monkeypatch, tmp_path, **overrides):
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    kwargs: Dict[str, Any] = {
+        "device_serial": "USB1",
+        "package_name": "com.x",
+        "duration": 1,
+        "throttle": 500,
+        "ignore_crashes": True,
+        "capture_log": True,
+        "enable_performance_monitor": True,
+        "task_id": 9,
+        "report_dir": str(fastbot_service.local_report_dir(9)),
+    }
+    kwargs.update(overrides)
+    return asyncio.run(fastbot_service.run_fastbot_local(**kwargs))
+
+
+def test_run_fastbot_local_records_replay_and_marks_enabled(
+    fake_collection, fake_recorder, tmp_path, monkeypatch
+):
+    result = _run_local(monkeypatch, tmp_path)
+    summary = result["summary"]
+    assert summary["local_replay_enabled"] is True
+    # 已实现的回放不再计入降级项（jank 帧监控 / perfetto 仍未覆盖）
+    assert summary["degraded"] == ["jank_frame_monitor", "perfetto"]
+
+    start = fake_recorder["start"]
+    assert start["serial"] == "USB1" and start["task_id"] == 9
+    assert Path(start["report_dir"]).is_dir(), "回放产物目录应已建好"
+    assert (start["pre_roll_sec"], start["post_roll_sec"]) == (30, 5)
+
+    event = result["crash_events"][0]
+    assert fake_recorder["capture"] == [("USB1", "CRASH", "t")]
+    # path 归一为平台约定，不外泄本机路径（文件名不变，前端按 filename 取）
+    assert event["replay"]["status"] == "READY"
+    assert event["replay"]["filename"] == "crash_t_01.mp4"
+    assert event["replay"]["path"] == "reports/fastbot/9/replays/crash_t_01.mp4"
+    assert fake_recorder["stop"] == ["USB1"]
+
+
+def test_run_fastbot_local_replay_unavailable_degrades(
+    fake_collection, tmp_path, monkeypatch
+):
+    """录制起不来（设备流未就绪等）时如实降级，不伪造回放。"""
+    from engine.core.device_stream.manager import device_manager
+
+    def _boom(*args, **kwargs):
+        raise ValueError("设备 USB1 未就绪")
+
+    monkeypatch.setattr(device_manager, "start_recording", _boom)
+    result = _run_local(monkeypatch, tmp_path)
+    assert result["summary"]["local_replay_enabled"] is False
+    assert result["summary"]["degraded"] == [
+        "jank_frame_monitor", "local_replay", "perfetto",
+    ]
+    assert fake_collection["logcat_kwargs"]["replay_callback"] is None
+    assert "replay" not in result["crash_events"][0]
+
+
+def test_run_fastbot_local_replay_opt_out_stays_quiet(fake_collection, tmp_path, monkeypatch):
+    """用户关掉开关：不启动录制，也不标注降级（不是"请求了但没做"）。"""
+    from engine.core.device_stream.manager import device_manager
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("关闭异常回放时不应启动录制")
+
+    monkeypatch.setattr(device_manager, "start_recording", _unexpected)
+    result = _run_local(monkeypatch, tmp_path, enable_local_replay=False)
+    assert result["summary"]["local_replay_enabled"] is False
+    assert result["summary"]["degraded"] == ["jank_frame_monitor", "perfetto"]
+
+
+# --------------------------- 回放产物上传 --------------------------- #
+
+def test_publish_local_replays_uploads_ready_and_flags_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    replay_dir = fastbot_service.local_report_dir(9) / "replays"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "crash_1.mp4").write_bytes(b"mp4-bytes")
+
+    uploads: List[Any] = []
+
+    def _upload(self, task_id, file_path, rel_path):
+        uploads.append((task_id, file_path, rel_path))
+        return {"path": f"reports/fastbot/{task_id}/{rel_path}"}
+
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "upload_client_fastbot_artifact", _upload)
+    report = {
+        "crash_events": [
+            {"replay": {"status": "READY", "filename": "crash_1.mp4", "path": "../../x"}},
+            {"replay": {"status": "READY", "filename": "crash_2.mp4"}},
+            {"replay": {"status": "UNAVAILABLE", "error": "no buffered video data"}},
+        ]
+    }
+    fastbot_service.publish_local_replays(
+        cloud_bridge.CloudBridge(upstream="http://127.0.0.1:9"), 9, report
+    )
+
+    assert uploads == [(9, str(replay_dir / "crash_1.mp4"), "replays/crash_1.mp4")]
+    ready = report["crash_events"][0]["replay"]
+    assert ready["status"] == "READY"
+    assert ready["path"] == "reports/fastbot/9/replays/crash_1.mp4"
+    missing = report["crash_events"][1]["replay"]
+    assert missing["status"] == "FAILED" and missing["filename"] == ""
+    assert "未生成" in missing["error"]
+    # 未就绪的事件不动
+    assert report["crash_events"][2]["replay"]["status"] == "UNAVAILABLE"
+
+
+def test_publish_local_replays_marks_upload_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    replay_dir = fastbot_service.local_report_dir(9) / "replays"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "crash_1.mp4").write_bytes(b"mp4")
+    # 文件名带路径分隔符时只取 basename，防止越界写入/读取
+    assert fastbot_service.local_replay_path(9, "../../etc/passwd") == (
+        replay_dir / "passwd"
+    )
+
+    def _fail(self, task_id, file_path, rel_path):
+        raise RuntimeError("隧道中断")
+
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "upload_client_fastbot_artifact", _fail)
+    report = {"crash_events": [{"replay": {"status": "READY", "filename": "crash_1.mp4"}}]}
+    fastbot_service.publish_local_replays(
+        cloud_bridge.CloudBridge(upstream="http://127.0.0.1:9"), 9, report
+    )
+    replay = report["crash_events"][0]["replay"]
+    assert replay["status"] == "FAILED"
+    assert "上传云端失败" in replay["error"]
+    assert replay["filename"] == ""
+
+
+def test_prune_local_reports_removes_expired_only(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    fresh = fastbot_service.local_report_dir(11)
+    stale = fastbot_service.local_report_dir(10)
+    (fresh / "replays").mkdir(parents=True)
+    (stale / "replays").mkdir(parents=True)
+    expired = time.time() - 8 * 86400
+    os.utime(stale, (expired, expired))
+
+    fastbot_service.prune_local_reports()
+
+    assert fresh.is_dir() and not stale.exists()
+
+
 # --------------------------- 收尾上报 --------------------------- #
 
 def test_run_and_report_finishes_with_platform_payload(fake_collection, monkeypatch):
@@ -162,6 +358,80 @@ def test_run_and_report_finishes_with_platform_payload(fake_collection, monkeypa
     }
 
 
+def test_run_and_report_uploads_replays_before_finish(monkeypatch, tmp_path):
+    """回放视频先落云端再收尾——报告一出现就能直接播放。"""
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    replay_dir = fastbot_service.local_report_dir(9) / "replays"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "crash_1.mp4").write_bytes(b"mp4")
+
+    async def _local(**kwargs):
+        return {
+            "performance_data": [], "jank_data": [], "jank_events": [], "trace_artifacts": [],
+            "crash_events": [
+                {"type": "CRASH", "time": "t", "replay": {
+                    "status": "READY", "filename": "crash_1.mp4", "duration_sec": 35,
+                }},
+            ],
+            "summary": {"total_crashes": 1, "total_anrs": 0, "local_replay_enabled": True},
+        }
+
+    order: List[Any] = []
+    done = threading.Event()
+
+    def _upload(self, task_id, file_path, rel_path):
+        order.append(("upload", task_id, rel_path, Path(file_path).read_bytes()))
+        return {}
+
+    def _finish(self, task_id, payload):
+        order.append(("finish", task_id, payload))
+        done.set()
+        return {}
+
+    monkeypatch.setattr(fastbot_service, "run_fastbot_local", _local)
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "upload_client_fastbot_artifact", _upload)
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "finish_client_fastbot", _finish)
+    fastbot_service.run_and_report(
+        task_id=9, auth_headers={}, device_serial="USB1", package_name="com.x",
+        duration=1, throttle=500, ignore_crashes=True, capture_log=True,
+        enable_performance_monitor=True,
+    )
+    assert done.wait(timeout=10), "收尾未在限时内完成"
+    assert [item[0] for item in order] == ["upload", "finish"]
+    assert order[0][1] == 9 and order[0][2] == "replays/crash_1.mp4"
+    assert order[0][3] == b"mp4"
+    replay = order[1][2]["report"]["crash_events"][0]["replay"]
+    assert replay["path"] == "reports/fastbot/9/replays/crash_1.mp4"
+
+
+def test_run_and_report_skips_upload_without_crash_events(monkeypatch):
+    async def _local(**kwargs):
+        return {
+            "performance_data": [], "jank_data": [], "jank_events": [], "trace_artifacts": [],
+            "crash_events": [],
+            "summary": {"total_crashes": 0, "total_anrs": 0, "local_replay_enabled": True},
+        }
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("无崩溃事件时不应发起产物上传")
+
+    done = threading.Event()
+    monkeypatch.setattr(fastbot_service, "run_fastbot_local", _local)
+    monkeypatch.setattr(
+        cloud_bridge.CloudBridge, "upload_client_fastbot_artifact", _unexpected
+    )
+    monkeypatch.setattr(
+        cloud_bridge.CloudBridge, "finish_client_fastbot",
+        lambda self, task_id, payload: done.set() or {},
+    )
+    fastbot_service.run_and_report(
+        task_id=9, auth_headers={}, device_serial="USB1", package_name="com.x",
+        duration=1, throttle=500, ignore_crashes=True, capture_log=True,
+        enable_performance_monitor=True,
+    )
+    assert done.wait(timeout=10)
+
+
 def test_run_and_report_failed_run_still_finishes(monkeypatch):
     """采集异常也必须 finish(FAILED)——云端任务不得停留 RUNNING。"""
     finished: List[Dict[str, Any]] = []
@@ -187,7 +457,8 @@ def test_run_and_report_failed_run_still_finishes(monkeypatch):
     assert "device lost" in (finished[0]["report"]["summary"].get("error") or "")
 
 
-def test_start_fastbot_run_registers_cloud_task_and_spawns(monkeypatch):
+def test_start_fastbot_run_registers_cloud_task_and_spawns(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
     captured = {}
 
     def _create(self, payload):
@@ -225,8 +496,16 @@ def test_start_fastbot_run_registers_cloud_task_and_spawns(monkeypatch):
     spawn = captured["spawn"]
     assert spawn["task_id"] == 9
     assert spawn["enable_performance_monitor"] is True
+    # 异常回放默认开启（对齐 FastbotDashboard 表单默认值），显式关闭时如实透传
+    assert spawn["enable_local_replay"] is True
     assert spawn["event_weights"]["enable_custom_event_weights"] is True
     assert spawn["event_weights"]["pct_touch"] == 55
+
+    fastbot_service.start_fastbot_run(
+        bridge,
+        {"package_name": "com.x", "device_serial": "USB1", "enable_local_replay": False},
+    )
+    assert captured["spawn"]["enable_local_replay"] is False
 
     with pytest.raises(ValueError):
         fastbot_service.start_fastbot_run(bridge, {"package_name": "", "device_serial": "USB1"})
@@ -373,6 +652,7 @@ def test_fastbot_run_intercept_registers_and_returns_task_read(client, mock_clou
     assert data["id"] == 9 and data["status"] == "RUNNING"
     # 本地执行已启动
     assert spawned["task_id"] == 9 and spawned["device_serial"] == "USB1"
+    assert spawned["enable_local_replay"] is True
     # 云端登记走 client-fastbot（不是反代 /api/fastbot/run）
     posted = [r["path"] for r in mock_cloud.requests if r["method"] == "POST"]
     assert "/api/client-fastbot/" in posted

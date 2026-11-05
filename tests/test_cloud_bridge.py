@@ -166,3 +166,78 @@ def test_ensure_template_local_missing_file_raises(static_server, tmp_path, monk
             bridge.ensure_template_local("static/images/nope.png")
     finally:
         config_store.reset_for_tests()
+
+
+class _RawRecordServer:
+    """裸 HTTP 接收端：记录请求行/头/原始 body（引擎只发 multipart，不收，故不依赖 python-multipart）。"""
+
+    def __init__(self) -> None:
+        import http.server
+        import json
+
+        self.received: list = []
+        server_self = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler 协议名
+                length = int(self.headers.get("content-length") or 0)
+                body = self.rfile.read(length)
+                server_self.received.append(
+                    {
+                        "path": self.path,
+                        "content_type": self.headers.get("content-type") or "",
+                        "body": body,
+                    }
+                )
+                payload = json.dumps({"ok": True}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):  # 静音测试输出
+                return
+
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=10)
+
+
+def test_upload_client_fastbot_artifact_sends_multipart_path_and_bytes(tmp_path):
+    """回放 mp4 以 multipart 上传，path 走表单字段（对齐平台 client_fastbot 端点）。"""
+    server = _RawRecordServer()
+    server.start()
+    try:
+        replay_bytes = b"\x00\x00\x00\x18ftypmp42-replay-bytes"
+        replay = tmp_path / "crash_101010_01.mp4"
+        replay.write_bytes(replay_bytes)
+        bridge = CloudBridge(upstream=server.base_url)
+        result = bridge.upload_client_fastbot_artifact(
+            9, str(replay), "replays/crash_101010_01.mp4"
+        )
+        assert result == {"ok": True}
+
+        assert len(server.received) == 1
+        request = server.received[0]
+        assert request["path"] == "/api/client-fastbot/9/artifacts"
+        assert request["content_type"].startswith("multipart/form-data; boundary=")
+        body = request["body"]
+        assert b'name="path"' in body and b"replays/crash_101010_01.mp4" in body
+        assert b'name="file"; filename="crash_101010_01.mp4"' in body
+        assert b"application/octet-stream" in body
+        assert replay_bytes in body
+    finally:
+        server.stop()

@@ -17,7 +17,7 @@
 - GET  /api/scenarios/{id}/precheck 场景本地预检（形状对齐 scenarios.precheck_scenario_execution）
 - WS   /api/scenarios/ws/run/{id}  场景实时执行（协议对齐 scenarios.websocket_run_scenario）
 - POST /api/packages/{id}/install  App 包下载到本地 + adb install（形状对齐 packages.py）
-- POST /api/fastbot/run            Fastbot 本地轻量档采集 + client-fastbot 上报
+- POST /api/fastbot/run            Fastbot 本地轻量档采集（含异常回放）+ client-fastbot 上报
 - GET  /api/stream/ios-mjpeg/{serial}  iOS MJPEG 本地拦截（显式降级，T7）
 - WS   /ws/ios-mjpeg/{serial}          同上（close 4000 + 降级原因，T7）
 - POST /api/compatibility/replay-preflight  回放预检本地化（P4-2）
@@ -789,9 +789,10 @@ class FastbotRunPayload(BaseModel):
 async def run_fastbot_task_local(request: Request, payload: FastbotRunPayload) -> JSONResponse:
     """POST /api/fastbot/run 本地拦截（形状对齐 api/fastbot.py run_fastbot → FastbotTaskRead）。
 
-    轻量档：本机 Monkey/logcat/性能采集 + client-fastbot 上报；读接口
-    （/api/fastbot/tasks、/reports/{id}）仍走反代云端展示。
-    enable_jank_frame_monitor / enable_local_replay 请求降级（summary.degraded 标注）。
+    轻量档：本机 Monkey/logcat/性能采集 + 异常回放录制 + client-fastbot 上报；读接口
+    （/api/fastbot/tasks、/reports/{id}）仍走反代云端展示，Crash/ANR 回放视频作为
+    产物上传云端（replays/<name>.mp4，平台 /api/fastbot/replays 直接服务）。
+    enable_jank_frame_monitor 请求降级（summary.degraded 标注）。
     """
     from engine.core import fastbot_service
     from engine.core.device_stream.manager import device_manager
