@@ -13,6 +13,8 @@ ClientRun* 模型，pipeline 复用 _persist_case_result_and_build_case_report�
 - POST /api/client-runs/{id}/finish      {status: PASS|FAIL|WARNING|ABORTED|ERROR, aborted,
                                           duration, error, notify, exported_variables}
 - POST /api/client-templates             multipart file → {image_path: "static/images/element_<hash>.png"}
+- POST /api/client-fastbot/{id}/artifacts multipart file + path → reports/fastbot/{id}/<path>
+                                          （回放 mp4 走此上传，再由平台读接口服务）
 
 安全红线：本模块不落盘任何凭据；auth 头只在内存中随请求发出。
 """
@@ -255,6 +257,28 @@ class CloudBridge:
     def finish_client_fastbot(self, task_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         """POST /api/client-fastbot/{id}/finish（status + report 六列）。"""
         return self.post_json(f"/api/client-fastbot/{int(task_id)}/finish", payload)
+
+    def upload_client_fastbot_artifact(
+        self, task_id: int, file_path: str, rel_path: str
+    ) -> Dict[str, Any]:
+        """POST /api/client-fastbot/{id}/artifacts（产物落 reports/fastbot/{id}/<rel_path>）。
+
+        rel_path 形如 replays/<name>.mp4；上传后由
+        GET /api/fastbot/replays/{id}/{filename} 直接服务（与平台自跑同约定）。
+        """
+        with open(file_path, "rb") as handle:
+            files = {
+                "file": (
+                    os.path.basename(file_path),
+                    handle,
+                    "application/octet-stream",
+                )
+            }
+            return self.post_multipart(
+                f"/api/client-fastbot/{int(task_id)}/artifacts",
+                files,
+                {"path": str(rel_path)},
+            )
 
     # ---------- client-compatibility 上报（P4-2：回放本地执行 + 结果上报） ----------
 

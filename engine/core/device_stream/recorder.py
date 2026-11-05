@@ -1,4 +1,7 @@
 # 来源：AutoDroid backend/device_stream/recorder.py（vendor）。剥离点：无（纯本地录制会话）。
+# 本地差异（2026-11-04，真机实测）：写回放时按「窗口内实际帧数 / 窗口时长」定 fps。
+# 裸 h264 无容器时间戳，cv2 只能猜 fps（25），而 scrcpy 是变帧率（画面不动不发帧），
+# 32 秒窗口只送到 130 帧时回放会变成 5 秒快进。平台副本仍是固定 fps。
 import math
 import os
 import time
@@ -37,6 +40,37 @@ def _collect_h264_nal_types(data: bytes) -> Set[int]:
     return nal_types
 
 
+def _count_h264_frames(data: bytes) -> int:
+    """统计一个包里携带的 VCL NAL 数量，作为帧数近似（多 slice 帧会略微高估）。
+
+    scrcpy 送来的是变帧率码流（画面不动就不发帧），写回放时需要这个数量把
+    视频时长拉回真实窗口长度，否则回放会以固定 fps 快放/慢放。
+    """
+    count = 0
+    length = len(data)
+    index = 0
+
+    while index < length - 3:
+        start_code_len = 0
+        if data[index:index + 4] == b"\x00\x00\x00\x01":
+            start_code_len = 4
+        elif data[index:index + 3] == b"\x00\x00\x01":
+            start_code_len = 3
+
+        if not start_code_len:
+            index += 1
+            continue
+
+        nal_index = index + start_code_len
+        if nal_index < length:
+            nal_type = data[nal_index] & 0x1F
+            if 1 <= nal_type <= 5:
+                count += 1
+        index = nal_index
+
+    return count
+
+
 @dataclass
 class ReplayCaptureResult:
     status: str
@@ -59,7 +93,34 @@ class ReplayCaptureResult:
         }
 
 
-def transcode_h264_to_mp4(source_path: str, output_path: str) -> int:
+def _resolve_replay_fps(
+    natural_fps: float, expected_frames: int, expected_duration_sec: float
+) -> float:
+    """回放写入 fps：优先「窗口内实际帧数 / 窗口时长」，退化到容器猜测值。
+
+    容器猜测值对裸 h264 基本固定（25），而 scrcpy 是变帧率，直接用会让回放快放。
+    """
+    if expected_frames > 1 and expected_duration_sec > 0.5:
+        measured = expected_frames / float(expected_duration_sec)
+        if math.isfinite(measured) and 1.0 <= measured <= 120.0:
+            return measured
+    if math.isfinite(natural_fps) and 1 < natural_fps <= 240:
+        return natural_fps
+    return DEFAULT_REPLAY_FPS
+
+
+def transcode_h264_to_mp4(
+    source_path: str,
+    output_path: str,
+    expected_frames: int = 0,
+    expected_duration_sec: float = 0.0,
+) -> int:
+    """裸 h264 → mp4。给定期望帧数与窗口时长时按真实速率写，避免变帧率码流被固定 fps 快放。
+
+    裸 h264 没有容器时间戳，FFmpeg 只能猜一个 fps（通常 25）：32 秒窗口里实际只
+    送到 130 帧（画面不动时 scrcpy 不发帧）就变成 5 秒「快进」。拿到真实窗口时长
+    后按 frames/duration 写回放，时长与窗口一致。
+    """
     try:
         import cv2
     except Exception as exc:
@@ -80,9 +141,11 @@ def transcode_h264_to_mp4(source_path: str, output_path: str) -> int:
     except OSError:
         pass
     try:
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-        if not math.isfinite(fps) or fps <= 1 or fps > 240:
-            fps = DEFAULT_REPLAY_FPS
+        fps = _resolve_replay_fps(
+            float(capture.get(cv2.CAP_PROP_FPS) or 0.0),
+            expected_frames,
+            expected_duration_sec,
+        )
 
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -136,15 +199,17 @@ class _BufferSegment:
         self.has_data = False
         self.byte_count = 0
         self.keyframe_count = 0
+        self.frame_count = 0
         self._handle = open(path, "wb")
 
-    def write(self, data: bytes, now_mono: float, has_keyframe: bool) -> None:
+    def write(self, data: bytes, now_mono: float, has_keyframe: bool, frame_count: int = 0) -> None:
         if not data:
             return
         self._handle.write(data)
         self.has_data = True
         self.byte_count += len(data)
         self.ended_mono = now_mono
+        self.frame_count += max(0, int(frame_count))
         if has_keyframe:
             self.keyframe_count += 1
 
@@ -257,6 +322,7 @@ class RollingScrcpyRecorderSession:
         now_mono = time.monotonic()
         nal_types = _collect_h264_nal_types(data)
         has_keyframe = 5 in nal_types
+        frame_count = _count_h264_frames(data)
 
         with self._lock:
             if self._closed:
@@ -278,7 +344,9 @@ class RollingScrcpyRecorderSession:
                 self._latest_idr_packet = data
 
             if self._current_segment is not None:
-                self._current_segment.write(data, now_mono, has_keyframe=has_keyframe)
+                self._current_segment.write(
+                    data, now_mono, has_keyframe=has_keyframe, frame_count=frame_count
+                )
 
     def capture_replay(self, event_type: str, event_time: str) -> ReplayCaptureResult:
         if not self._capture_lock.acquire(blocking=False):
@@ -339,6 +407,10 @@ class RollingScrcpyRecorderSession:
             init_packets = list(latest_sps_pps)
             if latest_idr_packet:
                 init_packets.append(latest_idr_packet)
+            first_started = min(segment.started_mono for segment in selected_segments)
+            last_ended = max(segment.ended_mono for segment in selected_segments)
+            duration_sec = max(1, int(round(last_ended - first_started)))
+            window_frames = sum(int(segment.frame_count) for segment in selected_segments)
             try:
                 byte_count = self._write_replay_file(source_path, selected_segments, init_packets)
                 if byte_count <= 0:
@@ -348,7 +420,12 @@ class RollingScrcpyRecorderSession:
                         post_roll_sec=self.post_roll_sec,
                         error="empty replay output",
                     )
-                transcode_h264_to_mp4(source_path, output_path)
+                transcode_h264_to_mp4(
+                    source_path,
+                    output_path,
+                    expected_frames=window_frames,
+                    expected_duration_sec=duration_sec,
+                )
             finally:
                 try:
                     if os.path.isfile(source_path):
@@ -356,9 +433,6 @@ class RollingScrcpyRecorderSession:
                 except OSError:
                     pass
 
-            first_started = min(segment.started_mono for segment in selected_segments)
-            last_ended = max(segment.ended_mono for segment in selected_segments)
-            duration_sec = max(1, int(round(last_ended - first_started)))
             rel_path = os.path.relpath(output_path, self.project_root).replace(os.sep, "/")
             return ReplayCaptureResult(
                 status="READY",

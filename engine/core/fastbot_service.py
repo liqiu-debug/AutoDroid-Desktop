@@ -6,24 +6,30 @@
 - 资源部署（framework/monkeyq/fastbot-thirdpart jar + libs）→ Monkey 智能探索；
 - logcat 崩溃/ANR 监控（capture_log / ignore_crashes 语义同平台）；
 - CPU/内存采样（enable_performance_monitor）；
+- 崩溃异常回放（enable_local_replay）：本机滚动录制 scrcpy 码流，Crash / ANR 时
+  截取前 30 秒 + 事件后补录并按产物上传云端（replays/<name>.mp4，平台读接口服务）；
 - 汇总（summary 字段形状对齐 backend/fastbot/summary._compute_summary）；
 - 上报云端 client-fastbot（POST /api/client-fastbot/ + /{id}/finish），复用平台
   读接口展示（GET /api/fastbot/tasks、/reports/{id} 零改动）。
 
 未覆盖（重量级，如实后置）：jank 帧监控（gfxinfo/framestats）、perfetto 取证与
-分析、本地回放录像、startup/fluency 专项。请求这些开关时降级并在 summary 标注
-degraded，不伪造数据。
+分析、startup/fluency 专项。请求这些开关时降级并在 summary 标注 degraded，
+不伪造数据。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import threading
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from engine import config_store
 from engine.adb_scan import resolve_adb_binary
 from engine.core.cloud_bridge import CloudBridge
 from engine.core.fastbot import logcat as fastbot_logcat
@@ -40,10 +46,95 @@ from engine.core.fastbot.summary import _compute_summary
 logger = logging.getLogger(__name__)
 
 MONITOR_SHUTDOWN_TIMEOUT_SECONDS = 12
+# 异常回放窗口（对齐 backend/fastbot/runner.py 的 LOCAL_REPLAY_* 常量）
+LOCAL_REPLAY_PRE_ROLL_SEC = 30
+LOCAL_REPLAY_POST_ROLL_SEC = 5
+LOCAL_REPLAY_SEGMENT_SEC = 5
+# 本机回放产物目录：userData/fastbot_reports/<task_id>/replays/
+LOCAL_REPORTS_DIR_NAME = "fastbot_reports"
+LOCAL_REPORTS_RETAIN_DAYS = 7
 
 
 def _now_iso() -> str:
     return datetime.now().isoformat()
+
+
+# --------------------------------------------------------------------------- #
+#  异常回放：本机滚动录制 → Crash/ANR 截取 → 作为产物上传云端
+# --------------------------------------------------------------------------- #
+
+def local_report_dir(task_id: int) -> Path:
+    """本机回放产物目录（userData/fastbot_reports/<task_id>）。"""
+    return config_store.user_data_dir() / LOCAL_REPORTS_DIR_NAME / str(int(task_id))
+
+
+def local_replay_path(task_id: int, filename: str) -> Optional[Path]:
+    """回放 mp4 的本机路径；filename 只取 basename（拒绝路径穿越）。"""
+    name = os.path.basename(str(filename or "").strip())
+    if not name or name in (".", ".."):
+        return None
+    return local_report_dir(task_id) / "replays" / name
+
+
+def prune_local_reports(keep_days: int = LOCAL_REPORTS_RETAIN_DAYS) -> None:
+    """清理过期的本机回放产物目录（清理失败只记日志，绝不挡住任务启动）。"""
+    root = config_store.user_data_dir() / LOCAL_REPORTS_DIR_NAME
+    if not root.is_dir():
+        return
+    deadline = time.time() - max(1, int(keep_days)) * 86400
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        logger.warning("读取本机回放目录失败（跳过清理）: %s", exc)
+        return
+    for entry in entries:
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < deadline:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _normalize_replay_payload(payload: Dict[str, Any], task_id: int) -> Dict[str, Any]:
+    """回放 path 归一为平台约定（reports/fastbot/<id>/replays/<name>），不外泄本机路径。"""
+    filename = str(payload.get("filename") or "")
+    payload["path"] = (
+        f"reports/fastbot/{int(task_id)}/replays/{filename}" if filename else ""
+    )
+    return payload
+
+
+def _mark_replay_upload_failed(replay: Dict[str, Any], error: str) -> None:
+    """上传失败的如实标注（前端展示原因，而不是留一个打不开的播放器）。"""
+    replay["status"] = "FAILED"
+    replay["error"] = error
+    replay["filename"] = ""
+    replay["path"] = ""
+
+
+def publish_local_replays(bridge: CloudBridge, task_id: int, report: Dict[str, Any]) -> None:
+    """把本机回放 mp4 作为 client-fastbot 产物上传云端，供报告侧直接播放。
+
+    与平台自跑同约定：落 reports/fastbot/<id>/replays/<name>.mp4，
+    由 GET /api/fastbot/replays/{id}/{filename} 服务。
+    """
+    for event in report.get("crash_events") or []:
+        replay = event.get("replay") if isinstance(event, dict) else None
+        if not isinstance(replay, dict) or replay.get("status") != "READY":
+            continue
+        path = local_replay_path(task_id, replay.get("filename"))
+        if path is None or not path.is_file():
+            _mark_replay_upload_failed(replay, "回放视频未生成，无法上传云端")
+            continue
+        try:
+            bridge.upload_client_fastbot_artifact(task_id, str(path), f"replays/{path.name}")
+        except Exception as exc:
+            logger.warning(
+                "回放视频上传失败: task=%s file=%s error=%s", task_id, path.name, exc
+            )
+            _mark_replay_upload_failed(replay, f"回放视频上传云端失败：{exc}")
+            continue
+        replay["path"] = f"reports/fastbot/{int(task_id)}/replays/{path.name}"
 
 
 async def run_fastbot_local(
@@ -60,11 +151,16 @@ async def run_fastbot_local(
     pct_motion: int = 30,
     pct_syskeys: int = 5,
     pct_majornav: int = 15,
+    task_id: int = 0,
+    enable_local_replay: bool = True,
+    report_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """轻量档本地采集（对齐 run_fastbot_task 的监控协程 + Monkey 主进程编排）。
 
     返回 client-fastbot report 六列：performance_data / jank_data / jank_events /
     trace_artifacts / crash_events / summary。
+    enable_local_replay：本机滚动录制 scrcpy 码流，Crash/ANR 时截取回放；
+    录制不可用（设备流未就绪/未给产物目录）时按降级处理并在 summary 标注。
     """
     duration = max(1, int(duration or 0))
     throttle = max(0, int(throttle or 0))
@@ -91,6 +187,43 @@ async def run_fastbot_local(
     abort_event = asyncio.Event()
     should_abort = not ignore_crashes
 
+    replay_started = False
+    replay_dir = str(report_dir or "")
+    if enable_local_replay:
+        if not replay_dir:
+            logger.warning("未提供回放产物目录，本次不录制异常回放")
+        else:
+            try:
+                from engine.core.device_stream.manager import device_manager
+
+                os.makedirs(replay_dir, exist_ok=True)
+                device_manager.start_recording(
+                    device_serial,
+                    int(task_id or 0),
+                    replay_dir,
+                    LOCAL_REPLAY_PRE_ROLL_SEC,
+                    LOCAL_REPLAY_POST_ROLL_SEC,
+                    LOCAL_REPLAY_SEGMENT_SEC,
+                )
+                replay_started = True
+            except Exception as exc:
+                logger.warning("启动异常回放录制失败，本次报告无崩溃回放: %s", exc)
+
+    async def _capture_local_replay(event_type: str, event_time: str) -> Optional[Dict[str, Any]]:
+        """Crash/ANR 触发：截取回放窗口（含事件后补录）并返回事件 replay 载荷。"""
+        if not replay_started:
+            return None
+        from engine.core.device_stream.manager import device_manager
+
+        try:
+            result = await asyncio.to_thread(
+                device_manager.capture_replay, device_serial, event_type, event_time
+            )
+        except Exception as exc:
+            logger.warning("截取异常回放失败: %s", exc)
+            return {"status": "FAILED", "error": f"截取回放失败：{exc}"}
+        return _normalize_replay_payload(result.to_dict(), task_id) if result else None
+
     await _adb_shell(device_serial, "logcat -c", timeout=ADB_MONITOR_COMMAND_TIMEOUT_SECONDS)
 
     monitor_tasks: List[asyncio.Task] = []
@@ -110,6 +243,7 @@ async def run_fastbot_local(
                 capture_log,
                 abort_on_crash=should_abort,
                 abort_event=abort_event,
+                replay_callback=_capture_local_replay if replay_started else None,
             )
         )
     )
@@ -157,6 +291,13 @@ async def run_fastbot_local(
             for task in monitor_tasks:
                 task.cancel()
             await asyncio.gather(*monitor_tasks, return_exceptions=True)
+        if replay_started:
+            try:
+                from engine.core.device_stream.manager import device_manager
+
+                device_manager.stop_recording(device_serial)
+            except Exception as exc:
+                logger.warning("停止异常回放录制失败（忽略）: %s", exc)
 
     summary = _compute_summary(
         perf_data,
@@ -167,8 +308,12 @@ async def run_fastbot_local(
         enable_performance_monitor=enable_performance_monitor,
         enable_jank_frame_monitor=False,
     )
-    summary["local_replay_enabled"] = False
-    summary["degraded"] = ["jank_frame_monitor", "local_replay", "perfetto"]
+    summary["local_replay_enabled"] = bool(replay_started)
+    degraded = ["jank_frame_monitor"]
+    if enable_local_replay and not replay_started:
+        degraded.append("local_replay")
+    degraded.append("perfetto")
+    summary["degraded"] = degraded
 
     return {
         "performance_data": perf_data,
@@ -201,8 +346,9 @@ def run_and_report(
     capture_log: bool,
     enable_performance_monitor: bool,
     event_weights: Optional[Dict[str, Any]] = None,
+    enable_local_replay: bool = True,
 ) -> None:
-    """后台线程入口：本地采集 → client-fastbot finish 收尾（异常也收尾 FAILED）。"""
+    """后台线程入口：本地采集 → 回放产物上传 → client-fastbot finish 收尾（异常也收尾 FAILED）。"""
     weights = dict(event_weights or {})
 
     def _thread_main() -> None:
@@ -231,6 +377,9 @@ def run_and_report(
                     pct_motion=int(weights.get("pct_motion", 30) or 30),
                     pct_syskeys=int(weights.get("pct_syskeys", 5) or 5),
                     pct_majornav=int(weights.get("pct_majornav", 15) or 15),
+                    task_id=task_id,
+                    enable_local_replay=enable_local_replay,
+                    report_dir=str(local_report_dir(task_id)),
                 )
             )
         except Exception as exc:
@@ -244,6 +393,12 @@ def run_and_report(
 
         summary = report.get("summary") or {}
         bridge = CloudBridge(auth_headers=auth_headers)
+        if report.get("crash_events"):
+            # 回放视频随报告一并云端化：报告在任何入口都能直接播放
+            try:
+                publish_local_replays(bridge, task_id, report)
+            except Exception as exc:
+                logger.warning("回放产物上传阶段异常（已忽略）: %s", exc)
         try:
             bridge.finish_client_fastbot(
                 task_id,
@@ -258,12 +413,13 @@ def run_and_report(
         except Exception as exc:
             logger.warning("client-fastbot 收尾上报失败（结果仅本地日志可见）: %s", exc)
         logger.info(
-            "Fastbot 本地执行收尾: task=%s status=%s duration=%.1fs crashes=%s anrs=%s",
+            "Fastbot 本地执行收尾: task=%s status=%s duration=%.1fs crashes=%s anrs=%s replay=%s",
             task_id,
             status,
             time.time() - started,
             summary.get("total_crashes"),
             summary.get("total_anrs"),
+            summary.get("local_replay_enabled"),
         )
 
     threading.Thread(
@@ -274,7 +430,8 @@ def run_and_report(
 def start_fastbot_run(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str, Any]:
     """POST /api/fastbot/run 本地拦截：登记云端任务 → 后台本地采集 → 返回 FastbotTaskRead。
 
-    轻量档：enable_jank_frame_monitor / enable_local_replay 请求降级（summary.degraded 标注）。
+    本地采集覆盖异常回放（enable_local_replay，默认开）；jank 帧监控请求降级
+    （summary.degraded 标注）。
     """
     device_serial = str(payload.get("device_serial") or "").strip()
     package_name = str(payload.get("package_name") or "").strip()
@@ -291,6 +448,8 @@ def start_fastbot_run(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str,
     ignore_crashes = bool(payload.get("ignore_crashes", False))
     capture_log = bool(payload.get("capture_log", True))
     enable_performance_monitor = bool(payload.get("enable_performance_monitor", False))
+    enable_local_replay = bool(payload.get("enable_local_replay", True))
+    prune_local_reports()
 
     run_id = str(uuid.uuid4())
     created = create_cloud_task(
@@ -321,6 +480,7 @@ def start_fastbot_run(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str,
         ignore_crashes=ignore_crashes,
         capture_log=capture_log,
         enable_performance_monitor=enable_performance_monitor,
+        enable_local_replay=enable_local_replay,
         event_weights={
             "enable_custom_event_weights": bool(payload.get("enable_custom_event_weights", False)),
             "pct_touch": int(payload.get("pct_touch", 40) or 40),

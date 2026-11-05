@@ -158,7 +158,7 @@ macOS 下 `userData` 为 `~/Library/Application Support/AutoDroid`，Windows 为
 | 场景执行 | `POST /api/scenarios/{id}/run`、`GET /api/scenarios/{id}/precheck`、`WS /api/scenarios/ws/run/{id}` |
 | 运行控制 | `GET /api/runs/active`、`POST /api/runs/cancel` |
 | 安装包 | `POST /api/packages/{id}/install`（从平台下载到本地后 `adb install`） |
-| Fastbot | `POST /api/fastbot/run`（本地轻量档采集，结果上报 `client-fastbot`） |
+| Fastbot | `POST /api/fastbot/run`（本地轻量档采集：Monkey + logcat + 性能采样 + 崩溃异常回放；结果与回放产物上报 `client-fastbot`） |
 | 兼容性 | `POST /api/compatibility/replay-preflight`、`POST /api/compatibility/runs`（`installed_replay` 本地执行） |
 | 截图 | `GET /api/devices/{serial}/screenshot` |
 | iOS 投屏 | `GET /api/stream/ios-mjpeg/{serial}`、`WS /ws/ios-mjpeg/{serial}`：**显式降级**（WS 关闭码 4000 并给出原因），桌面端当前不提供 iOS 实时画面 |
