@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.websockets import WebSocket
 
 from engine import config_store, presence
-from engine.adb_scan import local_serials, scan_devices
+from engine.device_scan import all_local_serials as local_serials, scan_all_devices as scan_devices
 from engine.local_api import router as local_api_router
 from engine.proxy import (
     HOP_BY_HOP,
