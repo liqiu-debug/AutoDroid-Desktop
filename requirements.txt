@@ -10,6 +10,6 @@ Pillow>=12.1
 uiautomator2>=3.5
 numpy>=1.26
 opencv-python>=4.10
-# iOS 执行（engine/core/drivers/ios_*）可后置：未安装时仅 Android 可用
-# facebook-wda>=1.5
+# iOS 录制 / 用例执行（engine/core/drivers/ios_*、engine/core/ios_device.py）：有线 iPhone 走 WDA
+facebook-wda>=1.5,<2
 findit

@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from engine import config_store
 from engine.adb_scan import resolve_adb_binary
+from engine.core import device_busy
 from engine.core.cloud_bridge import CloudBridge
 from engine.core.fastbot import logcat as fastbot_logcat
 from engine.core.fastbot import monkey as fastbot_monkey
@@ -53,6 +54,17 @@ LOCAL_REPLAY_SEGMENT_SEC = 5
 # 本机回放产物目录：userData/fastbot_reports/<task_id>/replays/
 LOCAL_REPORTS_DIR_NAME = "fastbot_reports"
 LOCAL_REPORTS_RETAIN_DAYS = 7
+
+
+def _pct(source: Dict[str, Any], key: str, default: int) -> int:
+    """事件配比百分比：缺省/非法取默认，0 就是 0（旧写法 `or 默认值` 会把 0 变回默认）。"""
+    value = source.get(key, default)
+    if value is None or value == "":
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def _now_iso() -> str:
@@ -339,14 +351,16 @@ def _run_ios(*, weights: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     from engine.core.fastbot_ios.monkey import EventWeights
     from engine.core.fastbot_ios.runner import run_ios_fastbot_local
 
-    event_weights = EventWeights()
+    event_weights = EventWeights()  # 智能默认：点击为主（见 EventWeights 说明）
     if weights.get("enable_custom_event_weights"):
+        touch = _pct(weights, "pct_touch", 40)
+        motion = _pct(weights, "pct_motion", 30)
+        back = _pct(weights, "pct_majornav", 15)
+        syskeys = _pct(weights, "pct_syskeys", 5)
+        # 页面上「其他随机事件」= 100 - 已分配，iOS 侧落到长按
         event_weights = EventWeights(
-            touch=int(weights.get("pct_touch", 40) or 0),
-            motion=int(weights.get("pct_motion", 30) or 0),
-            long_press=10,
-            back=int(weights.get("pct_majornav", 15) or 0),
-            syskeys=int(weights.get("pct_syskeys", 5) or 0),
+            touch=touch, motion=motion, back=back, syskeys=syskeys,
+            long_press=max(0, 100 - (touch + motion + back + syskeys)),
         )
     return run_ios_fastbot_local(
         bundle_id=kwargs.pop("package_name"), weights=event_weights, **kwargs
@@ -371,6 +385,12 @@ def run_and_report(
     weights = dict(event_weights or {})
 
     def _thread_main() -> None:
+        try:
+            _run_and_finish()
+        finally:
+            device_busy.release(device_serial)  # 收尾出任何异常都不能把设备一直占着
+
+    def _run_and_finish() -> None:
         started = time.time()
         status = "COMPLETED"
         report: Dict[str, Any] = {
@@ -408,10 +428,10 @@ def run_and_report(
                         capture_log=capture_log,
                         enable_performance_monitor=enable_performance_monitor,
                         enable_custom_event_weights=bool(weights.get("enable_custom_event_weights")),
-                        pct_touch=int(weights.get("pct_touch", 40) or 40),
-                        pct_motion=int(weights.get("pct_motion", 30) or 30),
-                        pct_syskeys=int(weights.get("pct_syskeys", 5) or 5),
-                        pct_majornav=int(weights.get("pct_majornav", 15) or 15),
+                        pct_touch=_pct(weights, "pct_touch", 40),
+                        pct_motion=_pct(weights, "pct_motion", 30),
+                        pct_syskeys=_pct(weights, "pct_syskeys", 5),
+                        pct_majornav=_pct(weights, "pct_majornav", 15),
                         task_id=task_id,
                         enable_local_replay=enable_local_replay,
                         report_dir=str(local_report_dir(task_id)),
@@ -490,7 +510,45 @@ def start_fastbot_run(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str,
     enable_local_replay = bool(payload.get("enable_local_replay", True))
     prune_local_reports()
 
+    if device_busy.has_local_run(device_serial):
+        raise ValueError("该设备正在执行用例，请等执行结束后再试")
+    if not device_busy.try_acquire(device_serial):
+        raise ValueError("该设备正在跑稳定性测试，请等本次结束后再试")
     run_id = str(uuid.uuid4())
+    try:
+        created = _create_and_start(
+            bridge,
+            run_id=run_id,
+            device_serial=device_serial,
+            package_name=package_name,
+            duration=duration,
+            throttle=throttle,
+            ignore_crashes=ignore_crashes,
+            capture_log=capture_log,
+            enable_performance_monitor=enable_performance_monitor,
+            enable_local_replay=enable_local_replay,
+            payload=payload,
+        )
+    except BaseException:
+        device_busy.release(device_serial)  # 没起来就别占着设备
+        raise
+    return created
+
+
+def _create_and_start(
+    bridge: CloudBridge,
+    *,
+    run_id: str,
+    device_serial: str,
+    package_name: str,
+    duration: int,
+    throttle: int,
+    ignore_crashes: bool,
+    capture_log: bool,
+    enable_performance_monitor: bool,
+    enable_local_replay: bool,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
     created = create_cloud_task(
         bridge,
         {
@@ -522,10 +580,10 @@ def start_fastbot_run(bridge: CloudBridge, payload: Dict[str, Any]) -> Dict[str,
         enable_local_replay=enable_local_replay,
         event_weights={
             "enable_custom_event_weights": bool(payload.get("enable_custom_event_weights", False)),
-            "pct_touch": int(payload.get("pct_touch", 40) or 40),
-            "pct_motion": int(payload.get("pct_motion", 30) or 30),
-            "pct_syskeys": int(payload.get("pct_syskeys", 5) or 5),
-            "pct_majornav": int(payload.get("pct_majornav", 15) or 15),
+            "pct_touch": _pct(payload, "pct_touch", 40),
+            "pct_motion": _pct(payload, "pct_motion", 30),
+            "pct_syskeys": _pct(payload, "pct_syskeys", 5),
+            "pct_majornav": _pct(payload, "pct_majornav", 15),
         },
     )
     return created

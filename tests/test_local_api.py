@@ -486,13 +486,13 @@ def test_ws_scrcpy_unknown_device_closes_with_4004(client, fake_stream_manager):
     assert exc.value.code == 4004
 
 
-# --------------------------- T7：iOS MJPEG 本地拦截（显式降级） --------------------------- #
+# --------------------------- iOS MJPEG 本地拦截（中继用例见 test_ios_mjpeg.py） --------------------------- #
 
-def test_ios_mjpeg_http_intercepted_with_degradation(client, mock_cloud):
-    """GET /api/stream/ios-mjpeg/{serial} 本地拦截：503 显式降级，不透传云端。"""
+def test_ios_mjpeg_http_intercepted_with_explicit_503(client, mock_cloud):
+    """GET /api/stream/ios-mjpeg/{serial} 前端未使用：本地拦截 503，不透传云端。"""
     resp = client.get("/api/stream/ios-mjpeg/ios-1")
     assert resp.status_code == 503
-    assert "后续版本" in resp.json()["detail"]
+    assert "WebSocket" in resp.json()["detail"]
     # ?token= 查询通道容忍（<img src> 直挂形态）
     resp2 = client.get("/api/stream/ios-mjpeg/ios-1?token=abc.def")
     assert resp2.status_code == 503
@@ -500,15 +500,12 @@ def test_ios_mjpeg_http_intercepted_with_degradation(client, mock_cloud):
     assert not [r for r in mock_cloud.requests if "ios-mjpeg" in r["path"]]
 
 
-def test_ios_mjpeg_ws_intercepted_closes_4000_with_reason(client, mock_cloud):
-    """WS /ws/ios-mjpeg/{serial} 本地拦截：accept 后 close(4000) + 降级原因（容忍 ?token=）。"""
+def test_ios_mjpeg_ws_rejects_illegal_serial_with_4004(client, mock_cloud):
+    """WS /ws/ios-mjpeg/{serial}：非法设备 4004（容忍 ?token=），不透传云端。"""
     from starlette.websockets import WebSocketDisconnect
 
     with pytest.raises(WebSocketDisconnect) as exc:
         with client.websocket_connect("/ws/ios-mjpeg/ios-1?token=abc.def") as ws:
-            ws.receive_text()
-    assert exc.value.code == 4000
-    assert "后续版本" in (exc.value.reason or "")
-    # 不带 P1005_WDA_UNAVAILABLE（避免前端误判为「设备中心启动 WDA」路径）
-    assert "P1005_WDA_UNAVAILABLE" not in (exc.value.reason or "")
+            ws.receive_bytes()
+    assert exc.value.code == 4004
     assert not [r for r in mock_cloud.requests if "ios-mjpeg" in r["path"]]

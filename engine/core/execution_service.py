@@ -9,6 +9,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from engine.core.fastbot_ios.tools import is_ios_serial
 from engine.core.locator_resolution import resolve_locator_candidates
 from engine.core.step_contract import (
     build_standard_from_legacy_steps,
@@ -184,14 +185,11 @@ def _collect_step_runtime_export_vars(action: str, args: Dict[str, Any], value: 
 
 
 def resolve_device_platform(device_serial: str, platform_hint: Optional[str] = None) -> str:
-    """剥离点：DB Device 表 → 入参提示 + serial 前缀判定（ios: 前缀同 api/autojs.py 口径）。"""
+    """剥离点：DB Device 表 → 入参提示 + serial 形态判定（ios: 前缀 App 形态；USB 真机为裸 UDID）。"""
     hint = str(platform_hint or "").strip().lower()
     if hint in ("android", "ios"):
         return hint
-    serial = str(device_serial or "").strip()
-    if serial.startswith("ios:"):
-        return "ios"
-    return "android"
+    return "ios" if is_ios_serial(str(device_serial or "")) else "android"
 
 
 def _clean_text(value: Any) -> str:
@@ -894,7 +892,7 @@ def precheck_case_execution(
                 {
                     "status": "WARNING",
                     "code": "IOS_WDA_PROBE_SKIPPED",
-                    "message": "iOS WDA 探测后置（探测失败不阻断预检）",
+                    "message": "iOS 预检不探测 WDA：执行时自动确保就绪（首次启动约 30~90 秒）",
                 }
             )
 
@@ -951,8 +949,13 @@ def precheck_case_execution(
 
 
 def check_wda_health(wda_url: str) -> None:
-    """剥离点：iOS WDA 健康检查后置（桌面引擎 P1 仅 Android）。"""
-    raise RuntimeError("iOS WDA 支持在桌面引擎后置")
+    """WDA /status 探测；不可用时抛 RuntimeError。"""
+    import httpx
+
+    try:
+        httpx.get(f"{wda_url}/status", timeout=3.0).raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"iOS WDA 不可用: {exc}") from exc
 
 
 def restore_device_status_after_execution(*_args: Any, **_kwargs: Any) -> None:

@@ -237,6 +237,14 @@ class WdaSession:
     def activate(self) -> None:
         self._call("POST", self._s("/wda/apps/activate"), {"bundleId": self.bundle_id})
 
+    def terminate(self) -> None:
+        self._call("POST", self._s("/wda/apps/terminate"), {"bundleId": self.bundle_id}, timeout=30)
+
+    def source_json(self) -> Any:
+        # 去掉 visible/accessible：WDA 逐元素计算这两个属性最慢（真机设置页 1.9s → 0.3s，
+        # 取到的点击目标几乎不变），这段时间被测 App 是闲着的
+        return self._call("GET", self._s("/source?format=json&excluded_attributes=visible,accessible"), timeout=30)
+
     def perform(self, actions: List[Dict[str, Any]]) -> None:
         # 实测：App 在批内崩溃时 /actions 会挂起 ≈25s 再 500。不能提前断开：WDA 仍在处理
         # 挂起请求，后续调用会连锁超时；滞后由回放按 .ips 时间戳回溯兜底。
@@ -244,3 +252,50 @@ class WdaSession:
 
     def press_button(self, name: str) -> None:
         self._call("POST", self._s("/wda/pressButton"), {"name": name}, timeout=15)
+
+    def accept_alert(self) -> bool:
+        """接受当前系统弹窗；没有弹窗时 WDA 返回错误，这里返回 False。"""
+        try:
+            self._call("POST", self._s("/alert/accept"), {}, timeout=15)
+            return True
+        except WdaError:
+            return False
+
+
+class WdaHostRegistry:
+    """每台设备一个常驻 WdaHost（iproxy 转发 + 必要时拉起的 xcodebuild）。
+
+    录制、实时画面、截图、稳定性测试共用同一个 WDA：各自起停会反复花 30~90s 拉起
+    xcodebuild，且同一台设备上两个 iproxy/xcodebuild 会互相抢占。引擎退出时统一关闭。
+    """
+
+    def __init__(self, factory=WdaHost) -> None:
+        self._factory = factory
+        self._hosts: Dict[str, WdaHost] = {}
+        self._lock = threading.Lock()
+
+    def get(self, udid: str) -> WdaHost:
+        with self._lock:
+            host = self._hosts.get(udid)
+            if host is None:
+                host = self._factory(udid)
+                self._hosts[udid] = host
+        return host
+
+    def ensure_ready(self, udid: str) -> WdaHost:
+        host = self.get(udid)
+        host.ensure_ready()
+        return host
+
+    def close_all(self) -> None:
+        with self._lock:
+            hosts = list(self._hosts.values())
+            self._hosts.clear()
+        for host in hosts:
+            try:
+                host.close()
+            except Exception:  # pragma: no cover - 退出清理尽力而为
+                logger.debug("关闭 WDA 主机资源失败", exc_info=True)
+
+
+registry = WdaHostRegistry()

@@ -18,8 +18,10 @@
 - WS   /api/scenarios/ws/run/{id}  场景实时执行（协议对齐 scenarios.websocket_run_scenario）
 - POST /api/packages/{id}/install  App 包下载到本地 + adb install（形状对齐 packages.py）
 - POST /api/fastbot/run            Fastbot 本地轻量档采集（含异常回放）+ client-fastbot 上报
-- GET  /api/stream/ios-mjpeg/{serial}  iOS MJPEG 本地拦截（显式降级，T7）
-- WS   /ws/ios-mjpeg/{serial}          同上（close 4000 + 降级原因，T7）
+- GET  /api/devices/{serial}/screenshot  设备中心截图（Android adb / iOS WDA）
+- POST /api/devices/{serial}/wda/check   设备中心「启动 WDA」（iOS，WDA 在本机）
+- WS   /ws/ios-mjpeg/{serial}            iOS 实时画面（WDA MJPEG 中继，每条消息一帧 JPEG）
+- GET  /api/stream/ios-mjpeg/{serial}    HTTP 版 iOS 流（前端未使用，显式 503）
 - POST /api/compatibility/replay-preflight  回放预检本地化（P4-2）
 - POST /api/compatibility/runs              installed_replay 本地执行 + client-compatibility 上报（P4-2）
 """
@@ -205,15 +207,22 @@ async def execute_single_step(request: Request, payload: SingleStepPayload) -> R
 
 @router.get("/api/devices/{serial}/screenshot")
 async def device_screenshot(serial: str) -> Response:
-    """设备中心「查看截图」本地拦截（Android 本机 adb screencap）。
+    """设备中心「查看截图」本地拦截（Android 本机 adb screencap / iOS 本机 WDA）。
 
     契约与平台 backend/api/devices.py get_screenshot 一致：
     {"base64_img": ..., "image_format": "jpeg"}（预览规格最长边 ≤1280 的 JPEG）。
-    不拦截会反代到云端——云端 adb 看不到本机 USB 设备，报
-    「error: device '<serial>' not found」。iOS 截图依赖 WDA 本地化（遗留项），
-    与 iOS 投屏同策略显式降级。
+    不拦截会反代到云端——云端看不到本机 USB 设备，报
+    「error: device '<serial>' not found」。
     """
     from engine.adb_scan import resolve_adb_binary
+    from engine.core import ios_device
+    from engine.core.fastbot_ios.tools import is_ios_serial
+
+    if is_ios_serial(serial):
+        try:
+            return JSONResponse(content=await asyncio.to_thread(ios_device.preview_screenshot, serial))
+        except ios_device.IOSDeviceError as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
     try:
         adb = resolve_adb_binary()
@@ -225,7 +234,7 @@ async def device_screenshot(serial: str) -> Response:
     except _DeviceNotAttached as exc:
         return JSONResponse(
             status_code=404,
-            content={"detail": f"{exc}（iOS 截图暂未在桌面端本地化；Android 请检查 USB 连接与调试授权）"},
+            content={"detail": f"{exc}（请检查 USB 连接与调试授权）"},
         )
     except Exception as exc:  # noqa: BLE001 - 统一转可读错误
         logger.warning("本地截图失败: serial=%s error=%s", serial, exc)
@@ -241,7 +250,7 @@ async def device_screenshot(serial: str) -> Response:
 
 
 class _DeviceNotAttached(RuntimeError):
-    """设备不在本机 adb 清单（或 iOS 未本地化）时抛出，转 404 可读提示。"""
+    """设备不在本机 adb 清单时抛出，转 404 可读提示。"""
 
 
 def _screencap_png(adb: str, serial: str) -> bytes:
@@ -273,6 +282,41 @@ def _to_preview_jpeg(raw: bytes):
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=80)
     return base64.b64encode(buffer.getvalue()).decode("ascii"), "jpeg"
+
+
+@router.post("/api/devices/{serial}/wda/check")
+async def check_device_wda(serial: str) -> JSONResponse:
+    """设备中心「启动 WDA」本地拦截：有线 iPhone 的 WDA 在本机（iproxy + xcodebuild），云端探测不到。
+
+    响应形状对齐平台 devices.check_ios_wda（前端读 wda_healthy / status / error）。
+    冷启动超过请求等待上限时返回未就绪，启动在后台继续。
+    """
+    from engine.core import ios_device
+    from engine.core.fastbot_ios.tools import is_ios_serial
+
+    if not is_ios_serial(serial):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "P3002_WDA_IOS_ONLY: WDA 启动仅适用于 iOS 设备。"},
+        )
+    wda_url = None
+    error = None
+    try:
+        wda_url = await asyncio.to_thread(ios_device.wda_url, serial)
+    except ios_device.IOSDeviceError as exc:
+        error = str(exc)
+    return JSONResponse(
+        content={
+            "serial": serial,
+            "platform": "ios",
+            "wda_healthy": wda_url is not None,
+            "wda_url": wda_url,
+            "status": "IDLE" if wda_url is not None else "WDA_DOWN",
+            "error": error,
+            "attempted_start": False,
+            "recovered_by_cleanup": False,
+        }
+    )
 
 
 @router.post("/api/device/crop_template")
@@ -1079,44 +1123,73 @@ async def stream_profile_set(serial: str, payload: StreamProfilePayload) -> JSON
 
 
 # --------------------------------------------------------------------------- #
-#  iOS MJPEG 实时画面（T7：本地拦截，显式降级）
-#  协议形状对齐 backend/device_stream/router.py（WS /ws/ios-mjpeg/{serial} +
-#  GET /api/stream/ios-mjpeg/{serial}，?token= 查询参数容忍忽略）。
-#  本地引擎暂无 WDA/MJPEG relay 能力（遗留 C：iOS 全链路），不再透传云端
-#  （云端无本机设备只会得到误导性失败），改为显式降级提示——与 T6 同风格。
+#  iOS MJPEG 实时画面（engine.core.ios_mjpeg 中继）
+#  协议对齐 backend/device_stream/router.py：每条二进制消息一帧完整 JPEG；
+#  关闭码 4005 = WDA/MJPEG 上游不可用（reason 含 P1005_WDA_UNAVAILABLE），4004 = 非法设备，
+#  4000 = 内部错误。?token= 查询参数容忍忽略（本地端点不鉴权）。
 # --------------------------------------------------------------------------- #
 
-IOS_MJPEG_DEGRADED_MESSAGE = (
-    "客户端模式暂不支持 iOS 实时画面（本地化 MJPEG 链路后续版本提供）"
+IOS_MJPEG_HTTP_UNSUPPORTED_MESSAGE = (
+    "客户端的 iOS 实时画面走 WebSocket（/ws/ios-mjpeg/{serial}），不提供 HTTP multipart 流"
 )
+
+
+def _ws_close_reason(text: str) -> str:
+    """WebSocket 关闭原因上限 123 字节（中文按字符截断会超限，close 帧直接发不出去）。"""
+    return str(text).encode("utf-8")[:120].decode("utf-8", "ignore")
 
 
 @router.get("/api/stream/ios-mjpeg/{serial}")
 @router.get("/stream/ios-mjpeg/{serial}", include_in_schema=False)
 async def ios_mjpeg_stream_http(serial: str, token: Optional[str] = Query(default=None)) -> JSONResponse:
-    """GET /api/stream/ios-mjpeg/{serial} 本地拦截：显式降级（形状对齐 router.py 错误面）。
+    """GET /api/stream/ios-mjpeg/{serial}：前端只用 WS 版，这里显式 503（不透传云端）。"""
+    return JSONResponse(status_code=503, content={"detail": IOS_MJPEG_HTTP_UNSUPPORTED_MESSAGE})
 
-    - 503：上游/能力不可用（对齐 IOSMjpegStreamError 的 503 口径）；
-    - ?token= 兼容 <img src> 查询通道（本地端点不鉴权，直接容忍）。
-    """
-    logger.info("iOS MJPEG HTTP 本地拦截（降级）: serial=%s", serial)
-    return JSONResponse(status_code=503, content={"detail": IOS_MJPEG_DEGRADED_MESSAGE})
+
+async def _wait_ws_disconnect(websocket: WebSocket) -> None:
+    """客户端不发消息：receive 只在断开时返回。没有新帧时也要能及时发现断开并退订。"""
+    while True:
+        message = await websocket.receive()
+        if message.get("type") == "websocket.disconnect":
+            return
 
 
 @router.websocket("/ws/ios-mjpeg/{serial}")
 async def ios_mjpeg_stream_ws(websocket: WebSocket, serial: str) -> None:
-    """WS /ws/ios-mjpeg/{serial} 本地拦截：accept 后以 4000 关闭并给出降级原因。
+    """推送 iOS 实时画面（WDA MJPEG）。首次连接可能要等 WDA 冷启动（30~90s），期间页面显示连接中。"""
+    from engine.core import ios_mjpeg
 
-    关闭码对齐 router.py 语义（4000=服务侧不可用/内部错误，前端不自动重连）；
-    reason 显式说明客户端模式边界（不带 P1005_WDA_UNAVAILABLE，避免误导到
-    「设备中心启动 WDA」路径）。
-    """
-    logger.info("iOS MJPEG WS 本地拦截（降级）: serial=%s", serial)
     await websocket.accept()
     try:
-        await websocket.close(code=4000, reason=IOS_MJPEG_DEGRADED_MESSAGE[:120])
-    except Exception:
-        pass
+        hub = ios_mjpeg.mjpeg_hub(serial)
+    except ValueError as exc:
+        try:
+            await websocket.close(code=4004, reason=_ws_close_reason(str(exc)))
+        except Exception:
+            pass
+        return
+
+    logger.info("iOS 实时画面 WebSocket 已连接: %s", serial)
+    queue = hub.subscribe(asyncio.get_running_loop())
+    disconnected = asyncio.create_task(_wait_ws_disconnect(websocket))
+    try:
+        while True:
+            next_frame = asyncio.ensure_future(queue.get())
+            await asyncio.wait({next_frame, disconnected}, return_when=asyncio.FIRST_COMPLETED)
+            if disconnected.done():
+                next_frame.cancel()
+                return
+            frame = next_frame.result()
+            if frame is None:
+                reason = f"P1005_WDA_UNAVAILABLE: {hub.last_error}"
+                await websocket.close(code=4005, reason=_ws_close_reason(reason))
+                return
+            await websocket.send_bytes(frame)
+    except Exception as exc:  # noqa: BLE001 - 发送失败多为客户端已断开
+        logger.info("iOS 实时画面 WebSocket 结束: serial=%s %s", serial, exc)
+    finally:
+        disconnected.cancel()
+        hub.unsubscribe(queue)
 
 
 @router.websocket("/ws/scrcpy/{serial}")
@@ -1148,7 +1221,7 @@ async def scrcpy_video_stream(websocket: WebSocket, serial: str) -> None:
     except Exception as exc:
         logger.warning("视频流异常: serial=%s %s", serial, exc)
         code = 4004 if isinstance(exc, ValueError) else 4000
-        reason = str(exc)[:120] if isinstance(exc, ValueError) else "内部错误"
+        reason = _ws_close_reason(str(exc)) if isinstance(exc, ValueError) else "内部错误"
         try:
             await websocket.close(code=code, reason=reason)
         except Exception:

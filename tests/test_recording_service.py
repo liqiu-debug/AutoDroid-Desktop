@@ -264,11 +264,11 @@ def test_post_action_dump_timeout_uses_last_frame(fake_device, monkeypatch):
     assert device.screenshot_calls >= 1
 
 
-def test_interact_ios_rejected():
+def test_interact_illegal_ios_serial_is_a_readable_400():
     with pytest.raises(RecordingError) as exc:
         recording_service.interact_device(x=1, y=1, operation="click", device_serial="ios:udid")
     assert exc.value.status_code == 400
-    assert "Android" in str(exc.value)
+    assert "UDID" in str(exc.value)
 
 
 def test_execute_single_step_requires_device():

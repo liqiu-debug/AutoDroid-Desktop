@@ -658,11 +658,9 @@ class IOSLocatorMixin:
             ) from exc
 
     def _collect_page_text_candidates(self) -> List[str]:
-        session = self.client.session()
         source_candidates = [
-            lambda: session.source(),
-            lambda: getattr(session, "source", None),
-            lambda: self.client.source(),
+            lambda: self._page_source_fast(),
+            lambda: self.client.session().source(),
             lambda: getattr(self.client, "source", None),
         ]
 

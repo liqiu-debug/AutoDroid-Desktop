@@ -55,9 +55,8 @@ class IOSAppControlMixin:
 
         if not quick_mode:
             source_candidates = [
+                lambda: self._page_source_fast(),
                 lambda: session.source(),
-                lambda: getattr(session, "source", None),
-                lambda: self.client.source(),
                 lambda: getattr(self.client, "source", None),
             ]
             for getter in source_candidates:
@@ -188,31 +187,28 @@ class IOSAppControlMixin:
         except Exception:
             return False
 
-    def _tap_common_back_buttons(self) -> bool:
+    # 常见返回按钮：先精确匹配（文案 / 标识），再按包含匹配兜底
+    _BACK_BUTTON_PREDICATES = (
+        "name IN {'Back', 'back', '返回', '返回上一页', 'nav_back', 'btn_back', 'ic_back'}"
+        " OR label IN {'Back', 'back', '返回', '返回上一页'}",
+        "type == 'XCUIElementTypeButton' AND (name CONTAINS 'Back' OR label CONTAINS 'Back'"
+        " OR name CONTAINS '返回' OR label CONTAINS '返回')",
+    )
+
+    def _tap_common_back_buttons(self, timeout: float = 0.5) -> bool:
         """
         点击常见返回按钮文案/标识。
+
+        桌面端剥离点：原实现对 13 个候选逐个 self.click（每个等 5s 并做弹窗探测），
+        页面没有返回入口时整个 back 要 200s 以上；改为两次谓词查询、每次短等待。
         """
-        candidates = [
-            ("name", "Back"),
-            ("label", "Back"),
-            ("name", "back"),
-            ("label", "back"),
-            ("name", "返回"),
-            ("label", "返回"),
-            ("name", "返回上一页"),
-            ("label", "返回上一页"),
-            ("id", "back"),
-            ("id", "nav_back"),
-            ("id", "btn_back"),
-            ("id", "ic_back"),
-            (
-                "predicate",
-                "type == 'XCUIElementTypeButton' AND (name CONTAINS 'Back' OR label CONTAINS 'Back' OR name CONTAINS '返回' OR label CONTAINS '返回')",
-            ),
-        ]
-        for by, selector in candidates:
+        session = self.client.session()
+        for predicate in self._BACK_BUTTON_PREDICATES:
             try:
-                self.click(selector=selector, by=by)
+                selector_obj = session(predicate=predicate)
+                if not self._wait_selector(selector_obj, timeout=timeout):
+                    continue
+                selector_obj.get(timeout=timeout, raise_error=True).tap()
                 return True
             except Exception:
                 continue
