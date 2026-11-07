@@ -161,15 +161,15 @@ def _once_is_past(task: Dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- #
 
 def local_device_serials() -> Optional[set]:
-    """本机 adb 在线设备 serial 集合（None=清单未知，调用方不过滤）。"""
+    """本机在线设备 serial 集合：adb + iOS USB（None=清单未知，调用方不过滤）。"""
     try:
-        from engine.adb_scan import local_serials
+        from engine.device_scan import all_local_serials
     except Exception:  # pragma: no cover - 导入面兜底
         return None
     try:
-        return local_serials()
+        return all_local_serials()
     except Exception:
-        logger.warning("本机 adb 设备清单获取失败（按未知处理，不过滤）", exc_info=True)
+        logger.warning("本机设备清单获取失败（按未知处理，不过滤）", exc_info=True)
         return None
 
 
@@ -177,7 +177,7 @@ def _is_device_on_this_machine(serial: str, local: Optional[set]) -> bool:
     """T4：设备是否在本机（触发前过滤，避免多台桌面各自产生失败 run）。
 
     - 清单未知（adb 缺失/失败）→ fail-open 不过滤；
-    - ios: 前缀设备不在 adb 清单（本机 iOS 枚举随后续 iOS 链路提供）→ 不据此过滤。
+    - ios: 前缀是 App 形态（不走 USB 枚举）→ 不据此过滤；USB 真机（裸 UDID）按清单判断。
     """
     if local is None:
         return True

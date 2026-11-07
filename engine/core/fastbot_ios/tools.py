@@ -96,16 +96,50 @@ def device_info(udid: str) -> Dict[str, str]:
     return info
 
 
+def devicectl_marketing_names() -> Dict[str, str]:
+    """xcrun devicectl 报告的 {UDID: 市场名}（需 Xcode；不可用返回 {}，由机型表兜底）。"""
+    import json
+    import tempfile
+
+    xcrun = which("xcrun") or ("/usr/bin/xcrun" if os.path.exists("/usr/bin/xcrun") else None)
+    if not xcrun:
+        return {}
+    with tempfile.TemporaryDirectory(prefix="autodroid-devicectl-") as tmp:
+        out_path = os.path.join(tmp, "devices.json")
+        if _run([xcrun, "devicectl", "list", "devices", "--json-output", out_path], timeout=15) is None:
+            return {}
+        try:
+            with open(out_path, encoding="utf-8") as handle:
+                devices = (json.load(handle).get("result") or {}).get("devices") or []
+        except (OSError, ValueError):
+            return {}
+    names: Dict[str, str] = {}
+    for item in devices:
+        hardware = item.get("hardwareProperties") or {}
+        udid, name = str(hardware.get("udid") or ""), str(hardware.get("marketingName") or "")
+        if udid and name:
+            names[udid] = name
+    return names
+
+
 def scan_ios_devices() -> List[Dict[str, str]]:
-    """register 上报载荷（形状同 adb_scan.scan_devices）。"""
+    """register 上报载荷（形状同 adb_scan.scan_devices）。
+
+    model 上报市场名（如 iPhone 14 Pro），而不是机型标识 ProductType（iPhone15,2）。
+    """
+    from engine.core.fastbot_ios.models import marketing_name
+
+    udids = list_udids() or []
     result: List[Dict[str, str]] = []
-    for udid in list_udids() or []:
+    market_names = devicectl_marketing_names() if udids else {}
+    for udid in udids:
         info = device_info(udid)
+        product_type = info.get("ProductType") or ""
         result.append(
             {
                 "platform": "ios",
                 "serial": udid,
-                "model": info.get("ProductType") or "iPhone",
+                "model": market_names.get(udid) or marketing_name(product_type) or "iPhone",
                 "brand": "APPLE",
                 "android_version": "",
                 "os_version": info.get("ProductVersion") or "",

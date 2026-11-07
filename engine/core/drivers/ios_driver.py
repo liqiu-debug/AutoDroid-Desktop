@@ -117,7 +117,15 @@ class IOSDriver(
 
     @classmethod
     def _ensure_ocr_prewarm_started(cls) -> None:
-        """启动 OCR 预热（使用全局服务）"""
+        """启动 OCR 预热（使用全局服务）。
+
+        桌面端剥离点：引擎不打包 paddleocr（体积大），未安装时不预热——否则每次连接 iOS 设备
+        都会打一段 ERROR 堆栈；真正用到 OCR 的步骤仍会报出可读错误。
+        """
+        import importlib.util
+
+        if importlib.util.find_spec("paddleocr") is None:
+            return
         start_ocr_prewarm(use_angle_cls=False, lang="ch")
 
     @classmethod
@@ -735,15 +743,13 @@ class IOSDriver(
             raise
 
     def disconnect(self) -> None:
-        """断开 WDA 连接。"""
-        started_at = time.time()
-        try:
-            self.client.session().close()
-            self._log_action_success("disconnect", started_at)
-        except Exception as exc:
-            self._log_action_failure("disconnect", started_at, exc)
-        finally:
-            super().disconnect()
+        """断开 WDA 连接（桌面端不再 session().close()）。
+
+        client.session() 每次都新建 WDA 会话，新会话会让当前活动会话失效：驱动池回收
+        空闲驱动时，会把同一设备上正在跑的稳定性测试会话顶掉。无 bundleId 的会话没有
+        需要释放的资源，下次新建时 WDA 自行回收。
+        """
+        super().disconnect()
 
     def health_check(self) -> bool:
         """快速探测 WDA 会话是否仍可用（供连接池复用前调用）。"""

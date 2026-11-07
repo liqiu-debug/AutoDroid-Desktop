@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.websockets import WebSocket
 
 from engine import config_store, presence
+from engine.core import device_busy
 from engine.device_scan import all_local_serials as local_serials, scan_all_devices as scan_devices
 from engine.local_api import router as local_api_router
 from engine.proxy import (
@@ -242,6 +243,13 @@ def create_app() -> FastAPI:
                 task_scheduler.shutdown_scheduler()
             except Exception:
                 logger.warning("定时任务本地调度停止失败", exc_info=True)
+            try:
+                from engine.core import ios_device, ios_mjpeg
+
+                ios_mjpeg.shutdown()
+                ios_device.shutdown()
+            except Exception:
+                logger.warning("iOS 设备资源释放失败", exc_info=True)
             await app.state.http.aclose()
 
     app = FastAPI(title="AutoDroid Desktop Engine", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -497,7 +505,22 @@ def create_app() -> FastAPI:
         _schedule_device_discovery(auth_headers, upstream)
         _schedule_local_presence_refresh()
 
-        target = build_target_url(upstream, "/api/devices/", request.url.query)
+        fetched = await _fetch_upstream_device_list(request, upstream, "/api/devices/", auth_headers)
+        if isinstance(fetched, Response):
+            return fetched
+        data, devices = fetched
+
+        revived = overlay_local_presence(devices, _local_presence_snapshot())
+        if revived:
+            _schedule_presence_heal(auth_headers, revived)
+        device_busy.overlay(devices)
+        return JSONResponse(content=data)
+
+    async def _fetch_upstream_device_list(
+        request: Request, upstream: str, path: str, auth_headers: Dict[str, str]
+    ):
+        """回源设备列表 → (原始 JSON, 设备 dict 列表)；失败/非列表形状返回透传 Response。"""
+        target = build_target_url(upstream, path, request.url.query)
         # 需要改写响应体：显式 identity，避免上游压缩后再解压/透传不一致
         headers = dict(auth_headers)
         headers["accept-encoding"] = "identity"
@@ -518,10 +541,25 @@ def create_app() -> FastAPI:
         devices = _list_devices_payload(data)
         if devices is None:
             return passthrough_response(listed)
+        return data, devices
 
-        revived = overlay_local_presence(devices, _local_presence_snapshot())
-        if revived:
-            _schedule_presence_heal(auth_headers, revived)
+    @app.get("/api/fastbot/devices")
+    @app.get("/api/fastbot/devices/")
+    async def list_fastbot_devices_with_local_state(request: Request) -> Response:
+        """稳定性测试的设备列表：回源后覆盖本机在场与本机占用（跑测中 / 执行中）。
+
+        云端只知道它自己跑的任务；客户端本机跑的稳定性测试，云端仍报「空闲」。
+        """
+        upstream = require_upstream()
+        if not upstream:
+            return _upstream_missing()
+        auth_headers = _auth_headers(request)
+        fetched = await _fetch_upstream_device_list(request, upstream, "/api/fastbot/devices", auth_headers)
+        if isinstance(fetched, Response):
+            return fetched
+        data, devices = fetched
+        overlay_local_presence(devices, _local_presence_snapshot())
+        device_busy.overlay(devices)
         return JSONResponse(content=data)
 
     @app.websocket("/ws")

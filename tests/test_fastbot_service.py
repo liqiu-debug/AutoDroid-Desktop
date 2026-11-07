@@ -501,6 +501,10 @@ def test_start_fastbot_run_registers_cloud_task_and_spawns(monkeypatch, tmp_path
     assert spawn["event_weights"]["enable_custom_event_weights"] is True
     assert spawn["event_weights"]["pct_touch"] == 55
 
+    # 执行线程被 mock 掉不会走到收尾释放：模拟上一轮结束（同一设备不能并发跑测）
+    from engine.core import device_busy
+
+    device_busy.release("USB1")
     fastbot_service.start_fastbot_run(
         bridge,
         {"package_name": "com.x", "device_serial": "USB1", "enable_local_replay": False},

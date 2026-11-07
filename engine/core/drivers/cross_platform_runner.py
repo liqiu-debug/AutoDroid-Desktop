@@ -106,7 +106,8 @@ class DriverFactory:
         driver_cls = cls._registry.get(platform_lower)
         if driver_cls is None:
             supported = ", ".join(sorted(cls._registry.keys()))
-            raise ValueError(f"不支持的平台: {platform!r}，当前支持: {supported}")
+            hint = f"（iOS 驱动不可用：{_IOS_IMPORT_ERROR}）" if platform_lower == "ios" and _IOS_IMPORT_ERROR else ""
+            raise ValueError(f"不支持的平台: {platform!r}，当前支持: {supported}{hint}")
         return driver_cls(device_id=device_id, **kwargs)
 
 
@@ -130,6 +131,11 @@ class TestCaseRunner:
         # and platform-skipped steps.  Keep before_device_step's historical
         # semantics (real device actions only) for existing callers.
         self.before_step = before_step
+        if self.platform == "ios" and IOSDriver is not None and "wda_url" not in driver_kwargs:
+            # 桌面端：WDA 经 USB 转发到本机端口，地址按设备解析（未就绪时等冷启动）
+            from engine.core.ios_device import execution_wda_url
+
+            driver_kwargs["wda_url"] = execution_wda_url(device_id)
         # AUTODROID_DRIVER_POOL=1 时按设备复用驱动连接（团队服务器推荐开启）
         self._driver_pool = get_execution_driver_pool() if is_driver_pool_enabled() else None
         if self._driver_pool is not None:

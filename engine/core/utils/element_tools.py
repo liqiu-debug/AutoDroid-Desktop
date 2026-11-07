@@ -237,13 +237,37 @@ def _normalize_locator_text(raw: str) -> str:
 
 def _is_unstable_locator_text(raw: str) -> bool:
     """
-    动态文案（如进度/时间区间）不适合作为录制定位值。
-    例如: [00:00, 03:55] / 00:00-03:55
+    动态文案（如进度/时间区间）与 Swift 运行时类名不适合作为录制定位值。
+    例如: [00:00, 03:55] / 00:00-03:55 / _TtGC7SwiftUI32NavigationStackHosting
     """
     text = _normalize_locator_text(raw)
     if not text:
         return False
+    # iOS SwiftUI 容器把运行时类名当 name（如 _TtGC7SwiftUI32NavigationStackHosting）：不是界面文案
+    if text.startswith("_Tt"):
+        return True
     return bool(_DYNAMIC_TIME_RANGE_PATTERN.match(text))
+
+
+IOS_APPLICATION_TYPE = "XCUIElementTypeApplication"
+# 铺满屏幕的 iOS 容器（根节点 label 是 App 名，部分 App 的 Toolbar 也铺满屏并带 label）：
+# 点空白处不能录成「点击 计算器」——回放会点到屏幕中央
+_IOS_FULLSCREEN_CONTAINER_TYPES = frozenset(
+    {
+        IOS_APPLICATION_TYPE,
+        "XCUIElementTypeWindow",
+        "XCUIElementTypeOther",
+        "XCUIElementTypeToolbar",
+        "XCUIElementTypeScrollView",
+        "XCUIElementTypeTable",
+        "XCUIElementTypeCollectionView",
+        "XCUIElementTypeWebView",
+    }
+)
+
+
+def _is_ios_fullscreen_container(node: ET.Element, bounds: Tuple[int, int, int, int], screen_bounds) -> bool:
+    return bounds == screen_bounds and node.attrib.get("type") in _IOS_FULLSCREEN_CONTAINER_TYPES
 
 
 def calculate_element_from_coordinates(
@@ -281,6 +305,7 @@ def calculate_element_from_coordinates(
 
     # ---- 第一步：遍历收集所有候选节点 ----
     candidate_nodes = []
+    screen_bounds = parse_node_bounds(root.attrib) if root.attrib.get("type") == IOS_APPLICATION_TYPE else None
 
     def traverse(node):
         bounds = parse_node_bounds(node.attrib)
@@ -291,34 +316,35 @@ def calculate_element_from_coordinates(
             x1, y1, x2, y2 = scaled_bounds
             if x1 <= target_x <= x2 and y1 <= target_y <= y2:
                 matches = True
-                candidate_nodes.append({
-                    "node": node,
-                    "bounds": scaled_bounds,
-                    "area": (x2 - x1) * (y2 - y1),
-                    "is_leaf": len(node) == 0,
-                    "class": (
-                        node.attrib.get("class")
-                        or node.attrib.get("type")
-                        or str(getattr(node, "tag", "") or "")
-                    ),
-                    "res_id": (
-                        node.attrib.get("resource-id")
-                        or node.attrib.get("resourceId")
-                        or node.attrib.get("id")
-                        or ""
-                    ),
-                    "text": (
-                        node.attrib.get("text")
-                        or node.attrib.get("label")
-                        or node.attrib.get("value")
-                        or ""
-                    ),
-                    "desc": (
-                        node.attrib.get("content-desc")
-                        or node.attrib.get("name")
-                        or ""
-                    )
-                })
+                if not _is_ios_fullscreen_container(node, bounds, screen_bounds):
+                    candidate_nodes.append({
+                        "node": node,
+                        "bounds": scaled_bounds,
+                        "area": (x2 - x1) * (y2 - y1),
+                        "is_leaf": len(node) == 0,
+                        "class": (
+                            node.attrib.get("class")
+                            or node.attrib.get("type")
+                            or str(getattr(node, "tag", "") or "")
+                        ),
+                        "res_id": (
+                            node.attrib.get("resource-id")
+                            or node.attrib.get("resourceId")
+                            or node.attrib.get("id")
+                            or ""
+                        ),
+                        "text": (
+                            node.attrib.get("text")
+                            or node.attrib.get("label")
+                            or node.attrib.get("value")
+                            or ""
+                        ),
+                        "desc": (
+                            node.attrib.get("content-desc")
+                            or node.attrib.get("name")
+                            or ""
+                        )
+                    })
         else:
             matches = True  # 无 bounds 的根节点，继续遍历子节点
 

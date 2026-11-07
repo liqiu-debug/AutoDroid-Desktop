@@ -18,6 +18,9 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 # frozen 态若不带 datas 会报「Resource assets/u2.jar not found in uiautomator2 package」。
 datas = collect_data_files("uiautomator2") + collect_data_files("findit")
 
+# iOS 驱动（facebook-wda）：引擎里 IOSDriver 是可选导入（缺包只剩 Android），漏打不会构建失败，
+# 只会在运行时报「iOS 驱动不可用」——必须显式收集。
+
 hiddenimports = []
 for package in (
     "uvicorn",
@@ -29,6 +32,7 @@ for package in (
     "websockets",
     "uiautomator2",
     "findit",
+    "wda",
     "engine",
 ):
     try:

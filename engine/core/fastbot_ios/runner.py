@@ -20,6 +20,7 @@ from engine.core.fastbot_ios.crash import BUG_TYPE_JETSAM, CrashCollector, forma
 from engine.core.fastbot_ios.monkey import EventGenerator, EventWeights
 from engine.core.fastbot_ios.replay import MjpegReplayRecorder
 from engine.core.fastbot_ios.tools import udid_from_serial
+from engine.core.fastbot_ios.wda import registry as wda_registry
 from engine.core.fastbot_ios.wda import (
     APP_NOT_RUNNING,
     APP_RUNNING_FOREGROUND,
@@ -35,6 +36,9 @@ MAX_WDA_RECOVERIES = 5
 # throttle 语义对齐 Android（事件间隔 ms）；WDA 每事件自带 ≈200ms 开销，扣除后作为批内 pause
 WDA_INHERENT_EVENT_MS = 200
 CRASH_REPORT_WAIT_SECONDS = 20
+# 每隔几批刷新一次页面可点击控件（/source ≈0.3s，一批 ≈1.5s）
+TARGET_REFRESH_EVERY_BATCHES = 3
+SPRINGBOARD_BUNDLE_ID = "com.apple.springboard"
 
 
 def _now_hms() -> str:
@@ -54,7 +58,7 @@ def run_ios_fastbot_local(
     weights: Optional[EventWeights] = None,
     report_dir: Optional[str] = None,
     stop_flag: Optional[threading.Event] = None,
-    host_factory: Callable[[str], WdaHost] = WdaHost,
+    host_factory: Optional[Callable[[str], WdaHost]] = None,
 ) -> Dict[str, Any]:
     udid = udid_from_serial(device_serial)
     bundle_id = str(bundle_id or "").strip()
@@ -64,7 +68,9 @@ def run_ios_fastbot_local(
     pause_ms = max(50, int(throttle or 0) - WDA_INHERENT_EVENT_MS)
     stop_flag = stop_flag or threading.Event()
 
-    host = host_factory(udid)
+    # 默认用引擎共享的 WDA（与录制 / 实时画面共用，结束后保持连接）；测试可注入工厂
+    shared_host = host_factory is None
+    host = wda_registry.get(udid) if shared_host else host_factory(udid)
     session: Optional[WdaSession] = None
     recorder: Optional[MjpegReplayRecorder] = None
     sampler: Optional[ios_perf.PerfSampler] = None
@@ -74,12 +80,13 @@ def run_ios_fastbot_local(
     stats: Dict[str, Any] = {
         "events": 0, "batches": 0, "wda_errors": 0, "wda_recoveries": 0,
         "relaunches": 0, "escapes": 0, "external_kills": 0, "home_presses": 0,
+        "foreground_failures": 0,
     }
     work_dir = report_dir or tempfile.mkdtemp(prefix="ios-fastbot-")
     collector = CrashCollector(udid, os.path.join(work_dir, "ips_pull"))
     app_names: Set[str] = {bundle_id.rsplit(".", 1)[-1]}
     pmd3 = ios_perf.resolve_pymobiledevice3()
-    if pmd3 and capture_log:
+    if pmd3:
         exec_name = ios_perf.resolve_executable(pmd3, udid, bundle_id)
         if exec_name:
             app_names.add(exec_name)  # Jetsam 报告只有进程名
@@ -96,9 +103,10 @@ def run_ios_fastbot_local(
     try:
         host.ensure_ready()
         open_session()
-        if capture_log and collector.available:
+        # 崩溃判定靠新增的崩溃报告（不抓日志也要拉）：capture_log 只决定报告里带不带完整日志
+        if collector.available:
             collector.baseline()
-        elif capture_log:
+        else:
             degraded.append("crash_log")
         if enable_local_replay:
             recorder = MjpegReplayRecorder(host.mjpeg_port, os.path.join(work_dir, "replays"))
@@ -123,7 +131,7 @@ def run_ios_fastbot_local(
             """
             detected_mono, detected_wall = time.monotonic(), time.time()
             reports = collector.collect_new(bundle_id, app_names, CRASH_REPORT_WAIT_SECONDS) if (
-                capture_log and collector.available) else []
+                collector.available) else []
             if not reports:
                 if not count_external:
                     return True
@@ -157,25 +165,68 @@ def run_ios_fastbot_local(
                 crash_events.append(event)
             return bool(ignore_crashes)
 
+        def bring_to_front() -> bool:
+            """拉回目标 App：activate → 接受系统弹窗 → terminate + launch，每步以真实前台核对。"""
+            for _ in range(2):
+                session.activate()
+                time.sleep(1.0)
+                if session.active_bundle() == bundle_id:
+                    return True
+            # 系统弹窗（权限请求等）盖在最前时 activate 无效；能关掉就不必杀 App
+            if session.accept_alert():
+                time.sleep(1.0)
+                if session.active_bundle() == bundle_id:
+                    return True
+            try:
+                session.terminate()
+            except WdaError:
+                pass
+            session.launch()
+            stats["relaunches"] += 1
+            time.sleep(2.0)
+            if session.active_bundle() == bundle_id:
+                return True
+            stats["foreground_failures"] += 1
+            logger.warning("iOS 目标 App 未能回到前台: %s（前台=%s）", bundle_id, session.active_bundle())
+            return False
+
+        batches_since_targets = TARGET_REFRESH_EVERY_BATCHES  # 首批即取一次层级
         while not stop_flag.is_set() and time.monotonic() - started < duration:
             try:
-                state = session.app_state()
-                if state != APP_RUNNING_FOREGROUND:
+                # 以「真实前台 App」为准：按 Home 后 apps/state 仍会报 4（前台）约 0.5~1s，
+                # 只看 state 会把整批点击/滑动打到桌面上（点开别的 App、拉出 Spotlight）
+                front = session.active_bundle()
+                if front != bundle_id:
+                    state = session.app_state()
                     if state <= APP_NOT_RUNNING:
                         if stats["batches"] > 0 and not handle_exit():
                             aborted_reason = "crash"
                             break
                         session.launch()
                         stats["relaunches"] += 1
-                    else:
+                        time.sleep(1.5)
+                        batches_since_targets = TARGET_REFRESH_EVERY_BATCHES
+                        continue
+                    if state != APP_RUNNING_FOREGROUND or front == SPRINGBOARD_BUNDLE_ID:
                         stats["escapes"] += 1
-                        session.activate()
-                    time.sleep(1.0)
-                    continue
+                        bring_to_front()
+                        batches_since_targets = TARGET_REFRESH_EVERY_BATCHES
+                        continue
+                    # App 仍在前台、最前面是系统托管界面（Safari 视图、相册选择器等）：
+                    # 属于 App 内流程，照常测试，拉回或重启只会丢掉现场
+                if batches_since_targets >= TARGET_REFRESH_EVERY_BATCHES:
+                    batches_since_targets = 0
+                    try:
+                        stats["last_target_count"] = generator.set_targets_from_source(session.source_json())
+                    except WdaError as exc:
+                        logger.debug("刷新可点击控件失败（按随机坐标继续）: %s", exc)
+                        generator.targets = []
+                batches_since_targets += 1
                 payload, kinds = generator.batch(pause_ms)
                 if payload is None:
                     session.press_button("home")
                     stats["home_presses"] += 1
+                    time.sleep(1.0)  # 桌面停留片刻，下一轮由前台守护拉回
                 else:
                     session.perform(payload)
                 stats["events"] += len(kinds)
@@ -206,6 +257,7 @@ def run_ios_fastbot_local(
                     break
         stats["elapsed_sec"] = round(time.monotonic() - started, 1)
         stats["event_counts"] = dict(generator.counts)
+        stats["targeted_taps"] = generator.targeted_taps
     finally:
         if sampler is not None:
             sampler.stop()
@@ -214,7 +266,8 @@ def run_ios_fastbot_local(
             recorder.stop()
         if session is not None:
             session.close()
-        host.close()
+        if not shared_host:
+            host.close()
 
     summary = _compute_summary(
         perf_data, crash_events, jank_data=[], jank_events=[], trace_artifacts=[],

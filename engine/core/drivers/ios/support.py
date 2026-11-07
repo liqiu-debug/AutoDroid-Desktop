@@ -11,9 +11,24 @@ from typing import Any, Dict, Optional
 # 保持与拆分前一致的 logger 名称（backend.drivers.ios_driver），日志过滤与测试 assertLogs 兼容。
 logger = logging.getLogger("backend.drivers.ios_driver")
 
+# 页面层级去掉 visible / accessible：WDA 逐元素计算这两个属性最慢（真机 iOS 27：设置页
+# 1.5s → 0.35s，桌面 3.5s → 0.35s），录制解析、页面签名、文本断言都不读它们
+PAGE_SOURCE_FAST_PATH = "source?format=xml&excluded_attributes=visible,accessible"
+
 
 class IOSDriverSupportMixin:
     """日志、诊断与耗时指标辅助方法（IOSDriver 组成部分）。"""
+
+    def _page_source_fast(self, timeout: Optional[float] = None) -> str:
+        """当前页面层级 XML（无会话接口，去掉慢属性；WDA 不支持时回退完整层级）。"""
+        try:
+            value = self.client.http.get(PAGE_SOURCE_FAST_PATH, timeout=timeout).value
+            text = str(value or "").strip()
+            if text:
+                return text
+        except Exception as exc:
+            logger.debug("iOS 快速层级获取失败，回退完整层级: %s", exc)
+        return str(self.client.source() or "").strip()
 
     @staticmethod
     def _truncate_log_value(value: Any, max_len: int = 96) -> str:

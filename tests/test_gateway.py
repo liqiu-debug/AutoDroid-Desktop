@@ -81,6 +81,10 @@ class _MockUpstream:
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if self.path.startswith("/api/fastbot/devices"):
+                    owner.requests.append({"path": self.path, "body": None, "headers": dict(self.headers)})
+                    self._send(200, owner.devices)
+                    return
                 if self.path.startswith("/api/devices"):
                     if owner.list_status != 200:
                         self._send(owner.list_status, {"detail": "Not authenticated"})
@@ -809,3 +813,33 @@ def test_device_screenshot_adb_missing_hint(client, monkeypatch):
     resp = client.get("/api/devices/X1/screenshot")
     assert resp.status_code == 503
     assert "adb" in resp.json()["detail"]
+
+
+
+def _login(client, mock_upstream):
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+
+
+def test_device_lists_show_local_stability_run_as_busy(client, mock_upstream):
+    """客户端本机跑稳定性：云端仍报空闲，引擎在两个设备列表上覆盖为「跑测中」。"""
+    from engine.core import device_busy
+
+    _login(client, mock_upstream)
+    device_busy.reset_for_tests()
+    assert device_busy.try_acquire("MOCK1")
+    try:
+        devices = client.get("/api/devices/", headers={"Authorization": "Bearer tok"}).json()
+        assert {d["serial"]: d["status"] for d in devices}["MOCK1"] == "FASTBOT_RUNNING"
+        resp = client.get("/api/fastbot/devices?include_ios=true", headers={"Authorization": "Bearer tok"})
+        assert resp.status_code == 200
+        assert {d["serial"]: d["status"] for d in resp.json()}["MOCK1"] == "FASTBOT_RUNNING"
+        fastbot_req = [r for r in mock_upstream.requests if r["path"].startswith("/api/fastbot/devices")][-1]
+        assert "include_ios=true" in fastbot_req["path"], "查询参数原样回源"
+    finally:
+        device_busy.reset_for_tests()
+    devices = client.get("/api/devices/", headers={"Authorization": "Bearer tok"}).json()
+    assert {d["serial"]: d["status"] for d in devices}["MOCK1"] == "IDLE"

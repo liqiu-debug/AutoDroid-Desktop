@@ -1,5 +1,5 @@
 # 来源：AutoDroid backend/api/recording.py（服务逻辑抽取）。
-# 剥离点：DB 会话/Device 表查询改为入参注入与本机判定；iOS 录制后置（仅 Android）；
+# 剥离点：DB 会话/Device 表查询改为入参注入与本机判定；iOS 走 USB + WDA（engine.core.ios_device）；
 # crop_template 落盘改为 userData/templates 本地缓存（云端上传由 cloud_bridge 负责）。
 """录制与单步执行服务（桌面引擎本地设备 I/O）。
 
@@ -21,8 +21,10 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
+from engine.core import ios_device
 from engine.core.device_transport_metrics import device_transport_metrics
 from engine.core.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner
 from engine.core.execution_service import resolve_device_platform
@@ -108,13 +110,27 @@ def _image_bytes_format(raw: bytes) -> str:
     return "png"
 
 
-def _take_screenshot_payload(device, serial: Optional[str] = None) -> Tuple[str, str]:
+def _ios_png_to_jpeg(raw: bytes) -> bytes:
+    """iOS 截图是整屏 PNG（约 3MB）：同尺寸转 JPEG，dump 响应小一个量级。
+
+    像素尺寸不能变：点击坐标与模板裁剪都按截图像素计算。
+    """
+    from PIL import Image as _Image
+
+    buffered = io.BytesIO()
+    _Image.open(io.BytesIO(raw)).convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
+    return buffered.getvalue()
+
+
+def _take_screenshot_payload(device, serial: Optional[str] = None, platform: Optional[str] = None) -> Tuple[str, str]:
     """截取设备屏幕，返回 (base64, 图像格式)。语义同上游 recording.py。"""
     started_at = time.monotonic()
     try:
         image = device.screenshot()
         if isinstance(image, (bytes, bytearray)):
             raw = bytes(image)
+            if platform == "ios":
+                raw = _ios_png_to_jpeg(raw)
             device_transport_metrics.record(
                 str(serial or ""), "recording_screenshot", time.monotonic() - started_at, byte_count=len(raw)
             )
@@ -138,27 +154,44 @@ def _take_screenshot_base64(device) -> str:
 
 
 def _connect_recording_device(serial: Optional[str]) -> Tuple[str, Any, Optional[Any]]:
-    """剥离点：DB 判定平台 → 本机判定；iOS 录制后置。"""
+    """剥离点：DB 判定平台 → 本机判定。返回 (平台, 设备, 用完后的释放回调)。"""
     platform = resolve_device_platform(str(serial or ""))
-    if platform != "android":
-        raise RecordingError(
-            "P2001_RECORDING_ANDROID_ONLY: iOS 设备仅支持执行，不支持录制。请切换到 Android 设备。",
-            status_code=400,
-        )
+    if platform == "ios":
+        try:
+            driver = ios_device.driver_pool.acquire(str(serial))
+        except ios_device.IOSDeviceError as exc:
+            raise RecordingError(str(exc), status_code=exc.status_code) from exc
+        return platform, driver, partial(ios_device.driver_pool.release, str(serial), driver)
     device = _recording_android_device_pool.acquire(serial)
     return platform, device, None
+
+
+def _cleanup_recording_device(cleanup) -> None:
+    if not callable(cleanup):
+        return
+    try:
+        cleanup()
+    except Exception:
+        logger.exception("录制设备连接释放失败")
 
 
 def _invalidate_recording_device(platform: Optional[str], serial: Optional[str], device: Optional[Any]) -> None:
     if platform != "ios":
         _recording_android_device_pool.invalidate(serial, device)
+        return
+    if serial:
+        ios_device.driver_pool.invalidate(str(serial), device)
 
 
 def _get_device_hierarchy_xml(device, platform: str) -> str:
+    if platform == "ios":
+        return ios_device.source_xml(device)
     return device.dump_hierarchy()
 
 
 def _get_device_info_payload(device, platform: str, serial: Optional[str]) -> Dict[str, Any]:
+    if platform == "ios":
+        return ios_device.device_info(device, serial)
     return device.info
 
 
@@ -212,20 +245,24 @@ def _build_device_dump_payload(
     if include_hierarchy:
         payload.update(_build_hierarchy_payload(device, platform=platform, serial=serial))
     if include_screenshot:
-        screenshot_b64, screenshot_format = _take_screenshot_payload(device, serial)
+        screenshot_b64, screenshot_format = _take_screenshot_payload(device, serial, platform)
         payload["screenshot"] = screenshot_b64
         payload["screenshot_format"] = screenshot_format
     return payload
 
 
 def _get_recording_coordinate_scale(device, platform: str) -> float:
-    return 1.0
+    if platform != "ios":
+        return 1.0
+    return ios_device.coordinate_scale(device)
 
 
 def _get_recording_post_action_delay(platform: str, operation: str) -> float:
     operation_text = str(operation or "").strip().lower()
     if operation_text in ("start_app", "stop_app"):
         return 0.6
+    if platform == "ios":
+        return 0.15 if operation_text == "click" else 0.3
     return 0.2
 
 
@@ -266,7 +303,7 @@ def _assemble_post_action_dump(
             payload["screenshot"] = screenshot_b64
             payload["screenshot_format"] = screenshot_format
             return payload
-    screenshot_b64, screenshot_format = _take_screenshot_payload(device, serial)
+    screenshot_b64, screenshot_format = _take_screenshot_payload(device, serial, platform)
     payload["screenshot"] = screenshot_b64
     payload["screenshot_format"] = screenshot_format
     return payload
@@ -310,9 +347,11 @@ def _post_action_dump_payload(
         )
 
     screenshot_future = None
+    # iOS 会话按设计串行使用（同平台 dump 口径）：确认稳定后再截图
+    parallel_screenshot = include_screenshot and platform != "ios"
     while time.monotonic() < deadline:
         time.sleep(UI_STABLE_POLL_GAP_SECONDS)
-        if include_screenshot and screenshot_future is None:
+        if parallel_screenshot and screenshot_future is None:
             screenshot_future = _POST_ACTION_EXECUTOR.submit(_take_screenshot_payload, device, serial)
         try:
             current_hierarchy = _build_hierarchy_payload(device, platform=platform, serial=serial)
@@ -337,23 +376,42 @@ def _post_action_dump_payload(
 
 def _perform_device_operation(device, platform: str, operation: str, x: int, y: int, action_data: Optional[str]) -> None:
     operation = str(operation or "").strip().lower()
+    is_ios = platform == "ios"
     if operation == "click":
-        device.click(x, y)
+        if is_ios:
+            device.click_by_coordinates(x, y)
+        else:
+            device.click(x, y)
         return
     if operation == "start_app":
-        device.app_start(action_data)
+        if is_ios:
+            device.start_app(action_data)
+        else:
+            device.app_start(action_data)
         return
     if operation == "stop_app":
-        device.app_stop(action_data)
+        if is_ios:
+            device.stop_app(action_data)
+        else:
+            device.app_stop(action_data)
         return
     if operation == "back":
-        device.press("back")
+        if is_ios:
+            device.back()
+        else:
+            device.press("back")
         return
     if operation == "home":
-        device.press("home")
+        if is_ios:
+            device.home()
+        else:
+            device.press("home")
         return
     if operation == "swipe":
-        device.swipe_ext(action_data or "up", scale=0.8)
+        if is_ios:
+            device.swipe(action_data or "up")
+        else:
+            device.swipe_ext(action_data or "up", scale=0.8)
         return
 
     raise RecordingError(f"不支持的设备操作: {operation}", status_code=400)
@@ -417,10 +475,11 @@ def dump_device(
     include_hierarchy: bool = True,
     include_screenshot: bool = True,
 ) -> Dict[str, Any]:
+    cleanup = None
     platform = None
     device = None
     try:
-        platform, device, _ = _connect_recording_device(serial)
+        platform, device, cleanup = _connect_recording_device(serial)
         return _build_device_dump_payload(
             device,
             platform=platform,
@@ -433,14 +492,17 @@ def dump_device(
         raise
     except Exception as e:
         _invalidate_recording_device(platform, serial, device)
-        raise RecordingError(str(e), status_code=500)
+        raise RecordingError(str(e), status_code=getattr(e, "status_code", 500))
+    finally:
+        _cleanup_recording_device(cleanup)
 
 
 def inspect_device(x: int, y: int, serial: Optional[str] = None) -> Dict[str, Any]:
+    cleanup = None
     platform = None
     device = None
     try:
-        platform, device, _ = _connect_recording_device(serial)
+        platform, device, cleanup = _connect_recording_device(serial)
         xml_dump = _get_device_hierarchy_xml(device, platform=platform)
         inspect_res = calculate_element_from_coordinates(
             xml_dump,
@@ -461,7 +523,9 @@ def inspect_device(x: int, y: int, serial: Optional[str] = None) -> Dict[str, An
         raise
     except Exception as e:
         _invalidate_recording_device(platform, serial, device)
-        raise RecordingError(str(e), status_code=500)
+        raise RecordingError(str(e), status_code=getattr(e, "status_code", 500))
+    finally:
+        _cleanup_recording_device(cleanup)
 
 
 def interact_device(
@@ -475,10 +539,11 @@ def interact_device(
     include_screenshot: bool = True,
     include_device_info: bool = True,
 ) -> Dict[str, Any]:
+    cleanup = None
     platform = None
     device = None
     try:
-        platform, device, _ = _connect_recording_device(device_serial)
+        platform, device, cleanup = _connect_recording_device(device_serial)
 
         inspect_res = {}
         step_info = None
@@ -533,7 +598,9 @@ def interact_device(
     except Exception as e:
         _invalidate_recording_device(platform, device_serial, device)
         logger.exception("设备交互失败: operation=%s device_serial=%s", operation, device_serial)
-        raise RecordingError(str(e), status_code=500)
+        raise RecordingError(str(e), status_code=getattr(e, "status_code", 500))
+    finally:
+        _cleanup_recording_device(cleanup)
 
 
 def _merge_execution_variables(
@@ -662,8 +729,15 @@ def execute_single_step(
         raise RecordingError("请选择执行设备", status_code=400)
 
     platform = resolve_device_platform(str(device_serial))
-    if platform != "android":
-        raise RecordingError("iOS 执行在桌面引擎后置（P1 仅 Android）", status_code=400)
+    driver_kwargs: Dict[str, Any] = {}
+    if platform == "ios":
+        try:
+            # 单步执行由前端请求发起（30s 超时）：按录制口径只等有限时间
+            driver_kwargs["wda_url"] = ios_device.execution_wda_url(
+                str(device_serial), wait_seconds=ios_device.WDA_REQUEST_WAIT_SECONDS
+            )
+        except ios_device.IOSDeviceError as exc:
+            raise RecordingError(str(exc), status_code=exc.status_code) from exc
     variables_map = _merge_execution_variables(env_variables, variables)
 
     runner = None
@@ -678,6 +752,7 @@ def execute_single_step(
         runner = CrossPlatformRunner(
             platform=platform,
             device_id=device_serial,
+            **driver_kwargs,
         )
         runner.runtime_variables.update(
             {
