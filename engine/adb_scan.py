@@ -186,6 +186,14 @@ def _connection_type(serial: str) -> str:
     return "usb"
 
 
+# 厂商市场型号候选属性（按优先级，与云端 api/devices.py 同）
+MARKET_NAME_PROPS = (
+    "ro.product.marketname",
+    "ro.vendor.oplus.market.name",
+    "ro.vivo.market.name",
+)
+
+
 def scan_devices(adb: Optional[str] = None) -> List[Dict[str, Any]]:
     """扫描本机 adb 设备，返回 register 上报所需的元数据列表。
 
@@ -225,11 +233,21 @@ def scan_devices(adb: Optional[str] = None) -> List[Dict[str, Any]]:
         brand = ""
         version = ""
         resolution = ""
+        market_name = ""
         try:
             prop = device.prop
             model = str(prop.model or "").strip()
             brand = str(prop.get("ro.product.brand") or "").strip().upper()
             version = str(prop.get("ro.build.version.release") or "").strip()
+            # 厂商市场型号（与云端 _MARKET_NAME_PROPS 同口径）：model 常是机型代号
+            # （PKZ110），市场名才是用户认得的「OPPO Reno14 Pro」
+            for key in MARKET_NAME_PROPS:
+                value = str(prop.get(key) or "").strip()
+                if value and value.lower() not in ("null", "unknown"):
+                    market_name = value
+                    break
+            if market_name == model:
+                market_name = ""
         except Exception as exc:
             logger.warning("读取 %s 属性失败: %s", serial, exc)
         try:
@@ -243,6 +261,7 @@ def scan_devices(adb: Optional[str] = None) -> List[Dict[str, Any]]:
                 "platform": "android",
                 "serial": serial,
                 "model": model or "Unknown",
+                "market_name": market_name or None,
                 "brand": brand,
                 "android_version": version,
                 "os_version": version,
