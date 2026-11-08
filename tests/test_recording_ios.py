@@ -227,13 +227,76 @@ def test_element_tools_skips_fullscreen_ios_containers_but_keeps_android_root():
     # 空白处只命中铺满屏的容器 → 未识别到元素（录制侧提示改用图像点击），而不是「点击 计算器」
     res = calculate_element_from_coordinates(IOS_SOURCE, 600, 2000, coordinate_scale=3.0)
     assert "error" in res, res
-    # 导航栏 name 是 Swift 运行时类名：不当语义定位
+    # 导航栏是布局容器（name 还是 Swift 运行时类名）
     res = calculate_element_from_coordinates(IOS_SOURCE, 600, 250, coordinate_scale=3.0)
-    assert res["strategy"] == "xpath", res
+    assert "error" in res, res
     android = (
         '<hierarchy><node bounds="[0,0][1080,2400]" text="首页" class="android.widget.FrameLayout"/></hierarchy>'
     )
     assert calculate_element_from_coordinates(android, 10, 10)["selector"] == "首页"
+
+
+def _ios_page(*children) -> str:
+    return (
+        '<XCUIElementTypeApplication type="XCUIElementTypeApplication" name="备忘录" label="备忘录" '
+        'x="0" y="0" width="393" height="852">' + "".join(children) + "</XCUIElementTypeApplication>"
+    )
+
+
+@pytest.mark.parametrize(
+    "container",
+    [
+        # 真机 2026-11-08：备忘录 / 地图 / 照片 / App Store 的真实节点
+        '<XCUIElementTypeToolbar type="XCUIElementTypeToolbar" name="Toolbar" label="工具栏" x="0" y="0" width="393" height="852"><a/></XCUIElementTypeToolbar>',
+        '<XCUIElementTypeToolbar type="XCUIElementTypeToolbar" name="Toolbar" label="工具栏" x="0" y="700" width="393" height="83"><a/></XCUIElementTypeToolbar>',
+        '<XCUIElementTypeTabBar type="XCUIElementTypeTabBar" name="标签页栏" label="标签页栏" x="0" y="700" width="393" height="83"><a/></XCUIElementTypeTabBar>',
+        '<XCUIElementTypeCollectionView type="XCUIElementTypeCollectionView" name="我的备忘录" label="我的备忘录" x="0" y="0" width="393" height="852"><a/></XCUIElementTypeCollectionView>',
+        '<XCUIElementTypeNavigationBar type="XCUIElementTypeNavigationBar" name="iCloud全部备忘录" x="0" y="700" width="393" height="133"><a/></XCUIElementTypeNavigationBar>',
+        '<XCUIElementTypeOther type="XCUIElementTypeOther" name="HomeView" x="8" y="476" width="377" height="368"><a/></XCUIElementTypeOther>',
+        '<XCUIElementTypeOther type="XCUIElementTypeOther" name="垂直滚动条, 4页" label="垂直滚动条, 4页" x="0" y="700" width="393" height="60"><a/></XCUIElementTypeOther>',
+        '<XCUIElementTypeOther type="XCUIElementTypeOther" name="视频, 六秒钟" label="视频, 六秒钟" x="0" y="-2268" width="393" height="3037"><a/></XCUIElementTypeOther>',
+    ],
+)
+def test_ios_layout_containers_are_not_recordable(container):
+    res = calculate_element_from_coordinates(_ios_page(container), 300, 2200, coordinate_scale=3.0)
+    assert "error" in res, res
+
+
+@pytest.mark.parametrize(
+    "element,selector",
+    [
+        ('<XCUIElementTypeButton type="XCUIElementTypeButton" name="com.apple.settings.general" label="通用" x="16" y="700" width="361" height="53"/>', "通用"),
+        ('<XCUIElementTypeCell type="XCUIElementTypeCell" name="AppStore.shelfItem.today" x="16" y="700" width="361" height="81"><a/></XCUIElementTypeCell>', "AppStore.shelfItem.today"),
+        # 小块卡片容器带界面文案：H5 / RN 常见的真实可点区域
+        ('<XCUIElementTypeOther type="XCUIElementTypeOther" name="现已推出" label="现已推出" x="20" y="700" width="353" height="100"><a/></XCUIElementTypeOther>', "现已推出"),
+        ('<XCUIElementTypeOther type="XCUIElementTypeOther" name="btn_buy" x="20" y="700" width="353" height="100"/>', "btn_buy"),
+    ],
+)
+def test_ios_real_elements_stay_recordable(element, selector):
+    res = calculate_element_from_coordinates(_ios_page(element), 300, 2200, coordinate_scale=3.0)
+    assert res.get("selector") == selector, res
+
+
+def test_ios_child_outside_parent_bounds_is_found():
+    """真机备忘录：搜索框不在其父容器范围内。之前按父节点剪枝漏掉它，前后端判定不一致。"""
+    page = _ios_page(
+        '<XCUIElementTypeOther type="XCUIElementTypeOther" x="0" y="0" width="10" height="10">'
+        '<XCUIElementTypeSearchField type="XCUIElementTypeSearchField" name="搜索" label="搜索" x="20" y="700" width="353" height="44"/>'
+        "</XCUIElementTypeOther>"
+    )
+    assert calculate_element_from_coordinates(page, 300, 2150, coordinate_scale=3.0).get("selector") == "搜索"
+
+
+def test_ios_map_view_is_not_recordable():
+    page = _ios_page(
+        '<XCUIElementTypeMap type="XCUIElementTypeMap" name="Map" label="{camera}" x="0" y="0" width="393" height="700"/>'
+    )
+    assert "error" in calculate_element_from_coordinates(page, 300, 300, coordinate_scale=3.0)
+
+
+def test_android_large_labelled_layout_unchanged():
+    xml = '<hierarchy><node bounds="[0,0][1080,2400]" text="首页" class="android.widget.FrameLayout"><node/></node></hierarchy>'
+    assert calculate_element_from_coordinates(xml, 10, 10)["selector"] == "首页"
 
 
 def test_interact_ios_click_taps_pixels_and_returns_new_dump(fake_wda):
