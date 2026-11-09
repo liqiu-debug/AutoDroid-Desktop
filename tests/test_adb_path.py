@@ -257,6 +257,70 @@ def test_find_adb_path_hits_home_android_platform_tools(tmp_path, monkeypatch):
     assert adb_scan.find_adb_path() == winner
 
 
+class _FakeProp(dict):
+    """adbutils PropertyCache 的最小替身：.model + .get()。"""
+
+    @property
+    def model(self):
+        return self.get("ro.product.model", "")
+
+
+class _FakeAdbDevice:
+    def __init__(self, serial, **props):
+        self.serial = serial
+        self.prop = _FakeProp(props)
+
+    def get_state(self):
+        return "device"
+
+    @staticmethod
+    def window_size(landscape=False):
+        import types
+
+        return types.SimpleNamespace(width=1080, height=2400)
+
+
+def test_scan_devices_reports_android_market_name(monkeypatch):
+    """model 是机型代号（PKZ110），市场名（OPPO Reno14 Pro）随登记上报，供云端展示。"""
+    import adbutils
+
+    monkeypatch.setattr(adb_scan, "ensure_server_started", lambda adb=None: True)
+    monkeypatch.setattr(
+        adbutils.adb,
+        "device_list",
+        lambda: [_FakeAdbDevice("S1", **{
+            "ro.product.model": "PKZ110",
+            "ro.product.brand": "oppo",
+            "ro.build.version.release": "15",
+            "ro.product.marketname": "OPPO Reno14 Pro",
+        })],
+    )
+    [payload] = adb_scan.scan_devices()
+    assert payload["model"] == "PKZ110"
+    assert payload["market_name"] == "OPPO Reno14 Pro"
+    assert payload["brand"] == "OPPO"
+
+
+def test_scan_devices_market_name_fallbacks_and_dedup(monkeypatch):
+    """通用属性为空时按 OPPO/vivo 顺序兜底；与 model 相同或未提供则不上报（None）。"""
+    import adbutils
+
+    monkeypatch.setattr(adb_scan, "ensure_server_started", lambda adb=None: True)
+
+    def devices():
+        return [
+            _FakeAdbDevice("S1", **{"ro.product.model": "V2312A", "ro.vivo.market.name": "vivo X100"}),
+            _FakeAdbDevice("S2", **{"ro.product.model": "Pixel 7", "ro.product.marketname": "Pixel 7"}),
+            _FakeAdbDevice("S3", **{"ro.product.model": "PKZ110"}),
+        ]
+
+    monkeypatch.setattr(adbutils.adb, "device_list", devices)
+    payloads = {p["serial"]: p for p in adb_scan.scan_devices()}
+    assert payloads["S1"]["market_name"] == "vivo X100"
+    assert payloads["S2"]["market_name"] is None
+    assert payloads["S3"]["market_name"] is None
+
+
 def test_scan_devices_missing_adb_logs_hint(clean_env, caplog):
     """G3：scan_devices 在 adb 缺失时日志携带统一中文指引。"""
     clean_env.setattr(adb_scan, "_server_ready", False)

@@ -250,24 +250,55 @@ def _is_unstable_locator_text(raw: str) -> bool:
 
 
 IOS_APPLICATION_TYPE = "XCUIElementTypeApplication"
-# 铺满屏幕的 iOS 容器（根节点 label 是 App 名，部分 App 的 Toolbar 也铺满屏并带 label）：
-# 点空白处不能录成「点击 计算器」——回放会点到屏幕中央
-_IOS_FULLSCREEN_CONTAINER_TYPES = frozenset(
+# iOS 无障碍树里的布局容器也带 label / name（工具栏、列表名、页面标识），但它们不是可点元素：
+# 点在这些区域上要走图像点击，不能录成「点击 工具栏」（回放会点到容器中央）。
+# 规则与前端 utils/recordableNode.js 保持一致。
+_IOS_STRUCTURAL_TYPES = frozenset(
     {
         IOS_APPLICATION_TYPE,
         "XCUIElementTypeWindow",
-        "XCUIElementTypeOther",
         "XCUIElementTypeToolbar",
+        "XCUIElementTypeNavigationBar",
+        "XCUIElementTypeTabBar",
         "XCUIElementTypeScrollView",
         "XCUIElementTypeTable",
         "XCUIElementTypeCollectionView",
         "XCUIElementTypeWebView",
+        "XCUIElementTypeStatusBar",
+        "XCUIElementTypeMap",  # label 是实时相机参数 JSON，回放时已变化
     }
 )
+_IOS_SCROLL_BAR_PATTERN = re.compile(r"(垂直|水平)滚动条|(vertical|horizontal) scroll bar", re.IGNORECASE)
+# 带 label 的通用容器铺满大半屏时同样按布局处理（同前端 isGlobalContainerNode 的 0.72）
+_IOS_LARGE_CONTAINER_RATIO = 0.72
 
 
-def _is_ios_fullscreen_container(node: ET.Element, bounds: Tuple[int, int, int, int], screen_bounds) -> bool:
-    return bounds == screen_bounds and node.attrib.get("type") in _IOS_FULLSCREEN_CONTAINER_TYPES
+def _visible_area_ratio(bounds: Tuple[int, int, int, int], screen_bounds) -> float:
+    """节点在屏幕内部分的占屏比（滚动内容可远超屏幕）。"""
+    if not screen_bounds:
+        return 0.0
+    x1, y1, x2, y2 = bounds
+    sx1, sy1, sx2, sy2 = screen_bounds
+    visible = max(0, min(x2, sx2) - max(x1, sx1)) * max(0, min(y2, sy2) - max(y1, sy1))
+    return visible / max((sx2 - sx1) * (sy2 - sy1), 1)
+
+
+def _is_ios_non_element(node: ET.Element, bounds: Tuple[int, int, int, int], screen_bounds) -> bool:
+    node_type = node.attrib.get("type")
+    if node_type in _IOS_STRUCTURAL_TYPES:
+        return True
+    if node_type != "XCUIElementTypeOther":
+        return False
+    label = _normalize_locator_text(node.attrib.get("label") or node.attrib.get("value") or "")
+    name = _normalize_locator_text(node.attrib.get("name") or "")
+    if _IOS_SCROLL_BAR_PATTERN.search(f"{label} {name}"):
+        return True
+    if len(node) == 0:
+        return False
+    # 有子节点、只有 name（开发者标识，如 HomeView）：相当于 Android 只有 resource-id 的布局
+    if not label or _is_unstable_locator_text(label):
+        return True
+    return _visible_area_ratio(bounds, screen_bounds) >= _IOS_LARGE_CONTAINER_RATIO
 
 
 def calculate_element_from_coordinates(
@@ -316,7 +347,7 @@ def calculate_element_from_coordinates(
             x1, y1, x2, y2 = scaled_bounds
             if x1 <= target_x <= x2 and y1 <= target_y <= y2:
                 matches = True
-                if not _is_ios_fullscreen_container(node, bounds, screen_bounds):
+                if not _is_ios_non_element(node, bounds, screen_bounds):
                     candidate_nodes.append({
                         "node": node,
                         "bounds": scaled_bounds,
@@ -348,7 +379,8 @@ def calculate_element_from_coordinates(
         else:
             matches = True  # 无 bounds 的根节点，继续遍历子节点
 
-        if matches:
+        # iOS 子节点可以超出父节点范围（0 尺寸容器、悬浮按钮）：不按父节点剪枝，与前端一致
+        if matches or screen_bounds is not None:
             for child in node:
                 traverse(child)
 
