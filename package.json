@@ -29,6 +29,14 @@
     "appId": "com.autojs.autodroid",
     "productName": "AutoDroid",
     "copyright": "Copyright © 2026 AutoDroid",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "liqiu-debug",
+        "repo": "AutoDroid-Desktop",
+        "releaseType": "release"
+      }
+    ],
     "directories": {
       "output": "release",
       "buildResources": "assets"
