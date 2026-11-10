@@ -93,7 +93,7 @@ Ok '依赖就绪'
 
 # ---------- 4. 出 Windows 安装包 ----------
 Step '构建 NSIS 安装包'
-npx electron-builder --win nsis --x64 --publish never
+npx electron-builder --win nsis --x64
 if ($LASTEXITCODE -ne 0) { Fail "electron-builder 失败（exit=$LASTEXITCODE）" }
 
 $setup = Get-ChildItem 'release' -Filter '*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
