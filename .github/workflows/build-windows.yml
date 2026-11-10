@@ -1,10 +1,15 @@
-# Windows 安装包 CI（可选路径：推送到 GitHub 后自动出包，无需本地 Windows 机器）
+# Windows 安装包 CI（推送到 GitHub 后自动出包，无需本地 Windows 机器）
 #
 # 用法：把 AutoDroid-Desktop 推送到 GitHub（与 AutoDroid 平台仓库同组织），
-# 本工作流在 windows-latest 上构建 引擎 → 前端 → NSIS 安装包，产物挂在
-# Actions 运行页的 Artifacts（AutoDroid-Windows-Setup）。
+# 本工作流在 windows-latest 上构建 引擎 → 前端 → NSIS 安装包：
+#   - 产物挂在 Actions 运行页的 Artifacts（AutoDroid-Windows-Setup）
+#   - 由 tag 触发时，同时把 exe 挂到该 tag 的 GitHub Release（Windows 客户端
+#     「检查更新」按 .exe 资产取包，不挂 Release 就收不到更新）
 #
 # 触发：手动 workflow_dispatch（按需出包），或打 tag 时。
+#
+# 注意：脚本必须以 UTF-8 **带 BOM** 保存。CI 里调用的是 Windows PowerShell 5.1
+# 的话，无 BOM 的中文串会被按 ANSI 解析导致引号错位（TerminatorExpectedAtEndOfString）。
 name: build-windows
 
 on:
@@ -12,6 +17,9 @@ on:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -48,7 +56,7 @@ jobs:
         working-directory: AutoDroid-Desktop
         shell: pwsh
         run: |
-          powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
+          pwsh -NoProfile -File .\build-windows.ps1
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
@@ -56,3 +64,10 @@ jobs:
           name: AutoDroid-Windows-Setup
           path: AutoDroid-Desktop/release/*.exe
           if-no-files-found: error
+
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: AutoDroid-Desktop/release/*.exe
+          fail_on_unmatched_files: true
