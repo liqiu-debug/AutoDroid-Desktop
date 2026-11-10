@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -11,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from engine import config_store, presence
-from engine.app import create_app
+from engine.app import LOCAL_PRESENCE_MAX_AGE_SECONDS, create_app
 
 
 class _MockUpstream:
@@ -25,6 +27,8 @@ class _MockUpstream:
         ]
         self.register_status = 200
         self.list_status = 200
+        self.package_bytes = bytes(range(256)) * 512  # 128 KiB 安装包
+        self.last_gzip_length = 0
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -74,6 +78,7 @@ class _MockUpstream:
                 if self.path.startswith("/api/gzip-payload"):
                     payload = json.dumps({"hello": "gzipped", "items": [1, 2, 3]}).encode("utf-8")
                     body = gzip.compress(payload)
+                    owner.last_gzip_length = len(body)
                     self.send_response(200)
                     self.send_header("content-type", "application/json")
                     self.send_header("content-encoding", "gzip")
@@ -84,6 +89,28 @@ class _MockUpstream:
                 if self.path.startswith("/api/fastbot/devices"):
                     owner.requests.append({"path": self.path, "body": None, "headers": dict(self.headers)})
                     self._send(200, owner.devices)
+                    return
+                if self.path.startswith("/api/packages/7/download"):
+                    # 安装包下载：与云端 FileResponse 一致，带 content-length，支持 Range 续传
+                    body = owner.package_bytes
+                    total = len(body)
+                    match = re.match(r"bytes=(\d+)-", self.headers.get("range") or "")
+                    if match:
+                        start = int(match.group(1))
+                        chunk = body[start:]
+                        self.send_response(206)
+                        self.send_header("content-type", "application/octet-stream")
+                        self.send_header("content-range", f"bytes {start}-{total - 1}/{total}")
+                        self.send_header("content-length", str(len(chunk)))
+                        self.end_headers()
+                        self.wfile.write(chunk)
+                        return
+                    self.send_response(200)
+                    self.send_header("content-type", "application/octet-stream")
+                    self.send_header("accept-ranges", "bytes")
+                    self.send_header("content-length", str(total))
+                    self.end_headers()
+                    self.wfile.write(body)
                     return
                 if self.path.startswith("/api/devices"):
                     if owner.list_status != 200:
@@ -359,11 +386,43 @@ def test_gzip_content_encoding_passthrough(client, mock_upstream):
     assert resp.status_code == 200
     # content-encoding 原样保留（引擎不解压后丢头）
     assert resp.headers.get("content-encoding") == "gzip"
+    # 原样字节转发：content-length 仍是上游声明的压缩后长度
+    assert resp.headers.get("content-length") == str(mock_upstream.last_gzip_length)
     # 响应体仍是 gzip 载荷（httpx 客户端透明解码后可读回 JSON）
     assert resp.json() == {"hello": "gzipped", "items": [1, 2, 3]}
     # 请求头的 Accept-Encoding 原样透传给上游（未被引擎改写）
     calls = [r for r in mock_upstream.requests if r["path"].startswith("/api/gzip-payload")]
     assert calls and calls[0]["headers"].get("accept-encoding") == "gzip"
+
+
+def test_package_download_keeps_content_length_for_progress(client, mock_upstream):
+    """安装包下载经引擎反代时保留 content-length：壳内更新下载器靠它算进度（否则恒为 0%）。"""
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    resp = client.get("/api/packages/7/download?token=tok")
+    assert resp.status_code == 200
+    total = len(mock_upstream.package_bytes)
+    assert resp.headers.get("content-length") == str(total)
+    assert "chunked" not in (resp.headers.get("transfer-encoding") or "")
+    assert resp.content == mock_upstream.package_bytes
+
+
+def test_package_download_range_resume_keeps_range_headers(client, mock_upstream):
+    """断点续传：206 的 content-range / content-length 原样透传。"""
+    client.post(
+        "/api/auth/token",
+        data={"username": "u", "password": "p"},
+        headers={"X-AutoDroid-Server": mock_upstream.base_url},
+    )
+    total = len(mock_upstream.package_bytes)
+    resp = client.get("/api/packages/7/download?token=tok", headers={"Range": "bytes=1000-"})
+    assert resp.status_code == 206
+    assert resp.headers.get("content-range") == f"bytes 1000-{total - 1}/{total}"
+    assert resp.headers.get("content-length") == str(total - 1000)
+    assert resp.content == mock_upstream.package_bytes[1000:]
 
 
 def test_server_header_stripped_on_generic_proxy(client, mock_upstream):
@@ -704,6 +763,112 @@ def test_devices_list_warms_local_presence_in_background(client, mock_upstream, 
     second = client.get("/api/devices/", headers={"Authorization": "Bearer tok"})
     statuses = {d["serial"]: d["status"] for d in second.json()}
     assert statuses["MOCK2"] == "IDLE"
+
+
+def test_fastbot_devices_overlay_and_heal_parity(client, mock_upstream):
+    """智能稳定性 / 流畅度 / 冷热启动三页的设备列表与 /api/devices/ 同等对待。
+
+    回归「客户端长时间静止后跑这三项显示设备离线，去设备中心刷新才恢复」：
+    这三页只查 /api/fastbot/devices，该端点此前既不刷新在场缓存、也不补心跳，
+    缓存一过期覆盖就失效，只剩云端心跳超时的 OFFLINE。
+    """
+    mock_upstream.devices = [{"id": 2, "serial": "MOCK2", "status": "OFFLINE", "platform": "android"}]
+    _login(client, mock_upstream)
+    _warm_local_presence(client, {"MOCK2"})
+
+    resp = client.get("/api/fastbot/devices?include_ios=true", headers={"Authorization": "Bearer req-tok"})
+    assert resp.status_code == 200
+    assert {d["serial"]: d["status"] for d in resp.json()} == {"MOCK2": "IDLE"}
+
+    def heals():
+        return [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/heartbeat")]
+
+    assert _wait_until(lambda: len(heals()) >= 1), "测试页也要补心跳让云端自愈"
+    assert json.loads(heals()[-1]["body"]) == {"serials": ["MOCK2"]}
+    assert heals()[-1]["headers"].get("authorization") == "Bearer req-tok", "以请求用户身份上报"
+
+
+def test_fastbot_devices_schedules_presence_refresh(client, mock_upstream, monkeypatch):
+    """测试页也驱动在场缓存后台刷新（与 /api/devices/ 一致）。"""
+    monkeypatch.setattr("engine.app.local_serials", lambda: {"MOCK2"})
+    mock_upstream.devices = [{"id": 2, "serial": "MOCK2", "status": "OFFLINE", "platform": "android"}]
+    _login(client, mock_upstream)
+    # 停掉常驻刷新，单独验证「请求驱动」这条路径
+    client.app.state.stop_local_presence_loop()
+    client.app.state.local_presence.update({"ts": 0.0, "attempt_ts": 0.0, "serials": set()})
+
+    resp = client.get("/api/fastbot/devices?include_ios=true", headers={"Authorization": "Bearer tok"})
+    assert resp.status_code == 200
+    assert _wait_until(lambda: client.app.state.local_presence["serials"] == {"MOCK2"}), "测试页应触发后台刷新"
+
+
+def _self_hosted_client(tmp_path, monkeypatch, local_serials_value):
+    """自建 app：让常驻刷新以极短周期跑（fixture 的 client 已经起在 10s 周期上）。"""
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    monkeypatch.delenv("AUTODROID_FRONTEND_DIST", raising=False)
+    monkeypatch.setattr("engine.app.local_serials", lambda: set(local_serials_value))
+    monkeypatch.setattr("engine.app.LOCAL_PRESENCE_LOOP_SECONDS", 0.02)
+    config_store.reset_for_tests()
+    presence.reset_for_tests()
+    app = create_app()
+    return TestClient(app)
+
+
+def test_local_presence_loop_keeps_cache_fresh_without_requests(tmp_path, monkeypatch, mock_upstream):
+    """长时间没有任何设备请求：常驻刷新仍让在场缓存不过期。
+
+    这是「客户端放久了再跑测试报设备离线」的根治点：智能稳定性/流畅度/冷热启动
+    三页只查 /api/fastbot/devices，缓存一过期覆盖就失效、只剩云端心跳超时的 OFFLINE。
+    """
+    with _self_hosted_client(tmp_path, monkeypatch, {"MOCK2"}) as test_client:
+        test_client.post(
+            "/api/auth/token",
+            data={"username": "u", "password": "p"},
+            headers={"X-AutoDroid-Server": mock_upstream.base_url},
+        )
+        assert test_client.app.state.local_presence.get("loop_task") is not None, "启动时就该起常驻刷新"
+        # 全程不碰任何设备接口，缓存也要自己续上
+        assert _wait_until(lambda: test_client.app.state.local_presence["serials"] == {"MOCK2"}), "无请求也应刷新"
+        assert time.monotonic() - test_client.app.state.local_presence["ts"] < LOCAL_PRESENCE_MAX_AGE_SECONDS
+
+
+def test_fastbot_devices_show_local_presence_after_long_idle(tmp_path, monkeypatch, mock_upstream):
+    """端到端回归症状：长时间静止后打开测试页，本机插着的设备不该显示离线。"""
+    mock_upstream.devices = [{"id": 2, "serial": "MOCK2", "status": "OFFLINE", "platform": "android"}]
+    with _self_hosted_client(tmp_path, monkeypatch, {"MOCK2"}) as test_client:
+        test_client.post(
+            "/api/auth/token",
+            data={"username": "u", "password": "p"},
+            headers={"X-AutoDroid-Server": mock_upstream.base_url},
+        )
+        # 模拟「放久了」：先把缓存打成过期，且不访问设备中心
+        test_client.app.state.local_presence.update({"ts": 0.0, "attempt_ts": 0.0, "serials": set()})
+        assert _wait_until(lambda: test_client.app.state.local_presence["serials"] == {"MOCK2"})
+
+        resp = test_client.get("/api/fastbot/devices?include_ios=true", headers={"Authorization": "Bearer tok"})
+        assert resp.status_code == 200
+        assert {d["serial"]: d["status"] for d in resp.json()} == {"MOCK2": "IDLE"}, "本机在场优先于云端心跳超时"
+
+
+def test_request_identity_restarts_heartbeat_after_engine_restart(client, mock_upstream):
+    """引擎重启/窗口重载后内存 token 丢失：带 token 的请求就地认领并重启心跳循环。
+
+    否则心跳永久停摆 → 云端按 last_seen 超时判离线，而前端照常带 token 请求、
+    界面看不出异常——就是「放久了设备离线」。
+    """
+    from engine import presence
+
+    _login(client, mock_upstream)
+    assert presence.get_token() is not None
+    presence.stop_heartbeat_loop()
+    presence.clear_token()  # 模拟引擎重启：内存态全丢
+    assert presence.get_token() is None
+
+    resp = client.get("/api/devices/", headers={"Authorization": "Bearer req-tok"})
+    assert resp.status_code == 200
+    assert presence.get_token() == "req-tok", "就地认领请求身份"
+    task = presence.get_heartbeat_task()
+    assert task is not None and not task.done(), "心跳循环已重启"
 
 
 def test_devices_list_passes_through_upstream_error_status(client, mock_upstream):

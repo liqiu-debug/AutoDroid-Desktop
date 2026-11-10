@@ -22,8 +22,6 @@
 - POST /api/devices/{serial}/wda/check   设备中心「启动 WDA」（iOS，WDA 在本机）
 - WS   /ws/ios-mjpeg/{serial}            iOS 实时画面（WDA MJPEG 中继，每条消息一帧 JPEG）
 - GET  /api/stream/ios-mjpeg/{serial}    HTTP 版 iOS 流（前端未使用，显式 503）
-- POST /api/compatibility/replay-preflight  回放预检本地化（P4-2）
-- POST /api/compatibility/runs              installed_replay 本地执行 + client-compatibility 上报（P4-2）
 """
 from __future__ import annotations
 
@@ -878,136 +876,16 @@ async def run_fastbot_task_local(request: Request, payload: FastbotRunPayload) -
 
 
 # --------------------------------------------------------------------------- #
-#  兼容性「升级后链路回放」（P4-2 按可行边界）
-#  - POST /api/compatibility/replay-preflight  预检本地化（设备快照本机 adb +
-#    冻结链路云端只读，形状对齐 CompatibilityReplayPreflightRead）
-#  - POST /api/compatibility/runs             installed_replay 本地执行 + 上报
-#    （云端 client-compatibility 建档 → 冻结链路本地回放 → report 收尾，P4-2 收尾）；
-#    其余执行模式（多设备矩阵/对比）保留云端 → 原样反代
+#  兼容性任务创建（升级后链路回放 / installed_replay 已随智能巡检下线）
+#  - POST /api/compatibility/runs  通用创建（多设备矩阵/对比等）原样反代云端；
+#    巡检回放本地执行（preflight + client-compatibility 上报）已整体移除
 # --------------------------------------------------------------------------- #
-
-class CompatibilityReplayPreflightPayload(BaseModel):
-    inspection_run_id: int
-    branch_key: str
-    device_serial: str
-    max_chains: int = 20
-
-
-@router.post("/api/compatibility/replay-preflight")
-@router.post("/compatibility/replay-preflight", include_in_schema=False)
-async def compatibility_replay_preflight_local(
-    request: Request, payload: CompatibilityReplayPreflightPayload
-) -> JSONResponse:
-    """回放预检本地化：设备安装包快照在本机读取（云端无本机设备，透传会误报未安装）。"""
-    from engine.core import compatibility_service
-
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    if not bridge.available:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "未配置上游服务器，无法拉取巡检来源数据，请先登录后重试"},
-        )
-    try:
-        result = await _to_thread(
-            compatibility_service.local_replay_preflight,
-            bridge,
-            inspection_run_id=payload.inspection_run_id,
-            branch_key=payload.branch_key,
-            device_serial=payload.device_serial,
-            max_chains=payload.max_chains,
-        )
-    except compatibility_service.CompatibilityPreflightError as exc:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    except Exception as exc:
-        logger.warning("回放预检本地化失败: %s", exc)
-        return JSONResponse(status_code=502, content={"detail": f"回放预检失败: {exc}"})
-    return JSONResponse(content=result)
-
-
-def _cloud_error_response(exc: Exception) -> Optional[JSONResponse]:
-    """httpx 上游错误 → 透传状态码与 detail（含 dict 形状的预检 blockers）。"""
-    import httpx
-
-    if not isinstance(exc, httpx.HTTPStatusError):
-        return None
-    status_code = int(exc.response.status_code or 502)
-    try:
-        detail = exc.response.json().get("detail")
-    except Exception:
-        detail = None
-    return JSONResponse(
-        status_code=status_code,
-        content={"detail": detail if detail is not None else str(exc)},
-    )
-
-
-async def _create_local_replay_run(request: Request, body: Dict[str, Any]) -> Response:
-    """installed_replay 创建：云端建档（client-compatibility）→ 本地后台回放 + 上报。"""
-    from engine.core import compatibility_service
-
-    auth_headers = auth_headers_from_request(request)
-    bridge = CloudBridge(auth_headers=auth_headers)
-    if not bridge.available:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "未配置上游服务器（请先在登录页填写服务器地址）"},
-        )
-    device_serials = [
-        str(item or "").strip()
-        for item in (body.get("device_serials") or [])
-        if str(item or "").strip()
-    ]
-    if not device_serials:
-        return JSONResponse(status_code=400, content={"detail": "请选择执行设备"})
-
-    create_payload = dict(body)
-    create_payload["device_serials"] = device_serials
-    create_payload["execution_mode"] = "installed_replay"
-    try:
-        installed = await _to_thread(
-            compatibility_service.build_client_installed_package,
-            bridge,
-            inspection_run_id=int(body.get("inspection_run_id") or 0),
-            device_serial=device_serials[0],
-        )
-        create_payload["installed_package"] = installed
-        run = await _to_thread(bridge.create_client_compatibility_run, create_payload)
-    except compatibility_service.CompatibilityPreflightError as exc:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    except Exception as exc:
-        cloud_error = _cloud_error_response(exc)
-        if cloud_error is not None:
-            return cloud_error
-        logger.warning("兼容性回放 run 创建失败: %s", exc)
-        return JSONResponse(status_code=502, content={"detail": f"回放任务创建失败: {exc}"})
-
-    # 后台逐链路本地回放 + report 收尾（前端轮询 GET /api/compatibility/runs/{id}）
-    compatibility_service.start_background_replay_run(run, auth_headers=auth_headers)
-    logger.info(
-        "兼容性回放本地执行已启动: run=%s devices=%s",
-        run.get("id"),
-        device_serials,
-    )
-    return JSONResponse(content=run)
-
 
 @router.post("/api/compatibility/runs")
 @router.post("/compatibility/runs", include_in_schema=False)
 async def compatibility_create_run_local(request: Request) -> Response:
-    """执行类端点本地拦截：installed_replay 本地执行 + 上报；其余模式原样反代。"""
+    """兼容性任务创建：执行模式（多设备矩阵/对比等）原样反代云端。"""
     from engine.proxy import proxy_request
-
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    execution_mode = str(body.get("execution_mode") or "").strip().lower()
-    if execution_mode == "installed_replay":
-        return await _create_local_replay_run(request, body)
-    if execution_mode in {"comparison", "page_compare", "device_compare"}:
-        logger.info("兼容性对比模式保留云端，原样反代: execution_mode=%s", execution_mode)
 
     upstream = _upstream_base(request)
     if not upstream:

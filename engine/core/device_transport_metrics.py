@@ -1,5 +1,5 @@
 # 来源：AutoDroid backend/device_transport_metrics.py（vendor）。剥离点：无（纯指标模块）。
-"""In-memory device transport metrics for wireless ADB and Agent tunnel diagnostics."""
+"""In-memory device transport metrics for wireless ADB device diagnostics."""
 from __future__ import annotations
 
 import threading

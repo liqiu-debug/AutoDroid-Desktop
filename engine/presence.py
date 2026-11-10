@@ -174,6 +174,11 @@ def start_heartbeat_loop(http: httpx.AsyncClient) -> Optional[asyncio.Task]:
     return _heartbeat_task
 
 
+def get_heartbeat_task() -> Optional[asyncio.Task]:
+    """当前心跳循环任务（未启动/已结束返回 None）；存活判定与测试观测用。"""
+    return _heartbeat_task
+
+
 def stop_heartbeat_loop() -> None:
     global _heartbeat_task
     task = _heartbeat_task

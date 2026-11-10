@@ -159,7 +159,6 @@ macOS 下 `userData` 为 `~/Library/Application Support/AutoDroid`，Windows 为
 | 运行控制 | `GET /api/runs/active`、`POST /api/runs/cancel` |
 | 安装包 | `POST /api/packages/{id}/install`（从平台下载到本地后 `adb install`） |
 | Fastbot | `POST /api/fastbot/run`（本地轻量档采集：Monkey + logcat + 性能采样 + 崩溃异常回放；结果与回放产物上报 `client-fastbot`） |
-| 兼容性 | `POST /api/compatibility/replay-preflight`、`POST /api/compatibility/runs`（`installed_replay` 本地执行） |
 | 截图 | `GET /api/devices/{serial}/screenshot` |
 | iOS 投屏 | `GET /api/stream/ios-mjpeg/{serial}`、`WS /ws/ios-mjpeg/{serial}`：**显式降级**（WS 关闭码 4000 并给出原因），桌面端当前不提供 iOS 实时画面 |
 
@@ -184,7 +183,6 @@ macOS 下 `userData` 为 `~/Library/Application Support/AutoDroid`，Windows 为
 | `POST /api/client-runs/` · `/{run_ref}/steps` · `/{run_ref}/finish` | 本地执行的步骤结果与最终报告上报 |
 | `POST /api/client-templates` | 录制时裁出的图像模板上传 |
 | `POST /api/client-fastbot` | Fastbot 采集结果上报 |
-| `POST /api/client-compatibility` | 兼容性回放结果上报 |
 | `GET /api/client-tasks` | 下发归属本客户端的定时任务（引擎每 300 秒拉取，本地到点触发） |
 | `version_lock`（原子 CAS） | 用例/场景并发编辑的乐观锁 |
 

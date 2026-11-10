@@ -180,7 +180,7 @@ def ensure_server_started(adb: Optional[str] = None) -> bool:
 
 
 def _connection_type(serial: str) -> str:
-    """远程隧道形态（127.0.0.1:<端口>）标记 remote_usb，其余为 usb。"""
+    """数字 IP:port 形态（无线 adb 等网络接入）标记 remote_usb，本机 USB 直插为 usb。"""
     if ":" in serial and serial.split(":", 1)[0].replace(".", "").isdigit():
         return "remote_usb"
     return "usb"

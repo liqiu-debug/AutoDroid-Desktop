@@ -280,19 +280,6 @@ class CloudBridge:
                 {"path": str(rel_path)},
             )
 
-    # ---------- client-compatibility 上报（P4-2：回放本地执行 + 结果上报） ----------
-
-    def create_client_compatibility_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/client-compatibility/runs → CompatibilityRunRead（client_executed run）。"""
-        return self.post_json("/api/client-compatibility/runs", payload)
-
-    def report_client_compatibility_run(self, run_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST /api/client-compatibility/runs/{id}/report（cell × chain 幂等上报）。"""
-        return self.post_json(
-            f"/api/client-compatibility/runs/{int(run_id)}/report", payload
-        )
-
-
 def auth_headers_from_request(request: Any) -> Dict[str, str]:
     """从入站请求摘鉴权头（Authorization/cookie）；无则回退登录 token。"""
     headers: Dict[str, str] = {}

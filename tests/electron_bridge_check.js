@@ -165,6 +165,7 @@ app.whenReady().then(async () => {
   // /flaky：首次连接发一半就掐断（模拟隧道 ~100s 截断），带 Range 的续传请求补齐剩余字节
   const flakyTotal = 192 * 1024
   let flakyServed = 0
+  const chunkedTotal = 256 * 1024
   const updateServer = http.createServer((req, res) => {
     const urlPath = String(req.url || '').split('?')[0]
     if (urlPath === '/flaky') {
@@ -187,6 +188,24 @@ app.whenReady().then(async () => {
         'Content-Range': `bytes ${start}-${flakyTotal - 1}/${flakyTotal}`,
       })
       res.end(chunk)
+      return
+    }
+    if (urlPath === '/chunked') {
+      // 不带 Content-Length（引擎反代 / 隧道把响应转成 chunked 时的形态）：进度只能靠 sizeHint 估算
+      const body = Buffer.alloc(chunkedTotal, 5)
+      const chunkSize = 32 * 1024
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+      let offset = 0
+      const timer = setInterval(() => {
+        if (offset >= body.length) {
+          clearInterval(timer)
+          res.end()
+          return
+        }
+        res.write(body.subarray(offset, offset + chunkSize))
+        offset += chunkSize
+      }, 80)
+      res.on('close', () => clearInterval(timer))
       return
     }
     if (urlPath === '/ok' || urlPath === '/second' || urlPath === '/slow') {
@@ -362,6 +381,51 @@ app.whenReady().then(async () => {
     JSON.stringify(flakyEvents.filter((e) => e.phase === 'downloading')),
   )
   check('续传路径不残留 .part', !fs.existsSync(`${flakyFile}.part`))
+  const flakyDownloading = flakyEvents.filter((e) => e.phase === 'downloading')
+  check(
+    '下载完成补发 100% 进度',
+    flakyDownloading.length > 0 && flakyDownloading[flakyDownloading.length - 1].percent === 100,
+    JSON.stringify(flakyDownloading.slice(-2)),
+  )
+
+  // 6h2. 响应不带 Content-Length（引擎反代 / 隧道转成 chunked）：回归「下载中进度一直为 0」
+  //      - 带 sizeHint：按近似总长估算百分比（>0，真正下完前封顶 99），完成后补发 100
+  //      - 不带任何大小：percent 为 null（前端改显示已下载字节），不能谎报 0%
+  const chunkedBefore = JSON.parse(await run('JSON.stringify(window.__updEventsB)')).length
+  const chunkedResult = await run(
+    `window.desktop.installUpdate({url: '${base}/chunked', fileName: 'chunked.dmg', version: '1.2.3', sizeHint: ${chunkedTotal}}).then(() => 'OK', (e) => 'ERR:' + e.message)`
+  )
+  check('无 Content-Length 的响应可下载完成', chunkedResult === 'OK', String(chunkedResult))
+  const chunkedEvents = JSON.parse(await run('JSON.stringify(window.__updEventsB)'))
+    .slice(chunkedBefore)
+    .filter((e) => e.phase === 'downloading')
+  const chunkedMid = chunkedEvents.slice(0, -1)
+  check(
+    '无总长时按 sizeHint 估算出非 0 进度（下完前 ≤99）',
+    chunkedMid.length > 0 &&
+      chunkedMid.some((e) => e.percent > 0) &&
+      chunkedMid.every((e) => typeof e.percent === 'number' && e.percent <= 99 && e.received > 0),
+    JSON.stringify(chunkedEvents),
+  )
+  check(
+    '无总长下载完成后进度为 100',
+    chunkedEvents.length > 0 && chunkedEvents[chunkedEvents.length - 1].percent === 100,
+    JSON.stringify(chunkedEvents.slice(-1)),
+  )
+  const unknownBefore = JSON.parse(await run('JSON.stringify(window.__updEventsB)')).length
+  const unknownResult = await run(
+    `window.desktop.installUpdate({url: '${base}/chunked', fileName: 'chunked-unknown.dmg', version: '1.2.3'}).then(() => 'OK', (e) => 'ERR:' + e.message)`
+  )
+  check('总长未知也能下载完成', unknownResult === 'OK', String(unknownResult))
+  const unknownMid = JSON.parse(await run('JSON.stringify(window.__updEventsB)'))
+    .slice(unknownBefore)
+    .filter((e) => e.phase === 'downloading')
+    .slice(0, -1)
+  check(
+    '总长未知时 percent 为 null 且带已下载字节（不谎报 0%）',
+    unknownMid.length > 0 && unknownMid.every((e) => e.percent === null && e.received > 0),
+    JSON.stringify(unknownMid),
+  )
 
   // 6i. 新增桥面：checkRelease / getUpdateStatus / applyUpdate / downloadPackage + onDownloadProgress
   check('checkRelease 已暴露', (await run('typeof window.desktop.checkRelease')) === 'function')

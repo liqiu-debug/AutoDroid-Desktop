@@ -22,9 +22,11 @@ contextBridge.exposeInMainWorld('desktop', {
    * - macOS：挂载校验 + 同卷暂存后返回 {ready:true}，由 applyUpdate 换包重启；
    * - win32：拉起安装向导后返回 {launched:true}。
    * 过程事件经 onUpdateProgress 订阅：
-   * {phase:'downloading',percent} | {phase:'ready',version,path} | {phase:'downloaded',path,message}
+   * {phase:'downloading',percent,received,total}（percent 为 0-100，总长未知时为 null）
+   * | {phase:'ready',version,path} | {phase:'downloaded',path,message}
    * | {phase:'done',path} | {phase:'error',message}。
-   * @param {{url: string, fileName: string, version?: string, expectedSize?: number, autoInstall?: boolean}} payload
+   * sizeHint：近似总字节数（如包管理按 MB 记录的大小），仅在服务端未声明总长时估算进度，不做校验。
+   * @param {{url: string, fileName: string, version?: string, expectedSize?: number, sizeHint?: number, autoInstall?: boolean}} payload
    * @returns {Promise<{launched: boolean, ready?: boolean, version?: string}>} 失败 reject Error(message)
    */
   installUpdate: async (payload) => {
@@ -55,8 +57,9 @@ contextBridge.exposeInMainWorld('desktop', {
 
   /**
    * 包管理下载：断点续传下载任意安装包到系统「下载」目录并定位文件。
-   * 过程事件经 onDownloadProgress 订阅：{phase:'downloading',percent} | {phase:'done',path,size} | {phase:'error',message}。
-   * @param {{url: string, fileName: string, expectedSize?: number}} payload
+   * 过程事件经 onDownloadProgress 订阅：{phase:'downloading',percent,received,total}（percent 总长未知时为 null）
+   * | {phase:'done',path,size} | {phase:'error',message}。
+   * @param {{url: string, fileName: string, expectedSize?: number, sizeHint?: number}} payload
    * @returns {Promise<{path: string, size: number}>} 失败 reject Error(message)
    */
   downloadPackage: async (payload) => {
@@ -69,7 +72,7 @@ contextBridge.exposeInMainWorld('desktop', {
 
   /**
    * 订阅包下载过程事件（desktop:download-package 专用通道）。
-   * @param {(event: {phase: 'downloading', percent: number} | {phase: 'done', path: string, size: number} | {phase: 'error', message: string}) => void} cb
+   * @param {(event: {phase: 'downloading', percent: number|null, received: number, total: number} | {phase: 'done', path: string, size: number} | {phase: 'error', message: string}) => void} cb
    * @returns {() => void} 退订函数
    */
   onDownloadProgress: (cb) => {
@@ -85,7 +88,7 @@ contextBridge.exposeInMainWorld('desktop', {
 
   /**
    * 订阅更新过程事件。
-   * @param {(event: {phase: 'downloading', percent: number} | {phase: 'done', path: string} | {phase: 'error', message: string}) => void} cb
+   * @param {(event: {phase: 'downloading', percent: number|null, received: number, total: number} | {phase: 'done', path: string} | {phase: 'error', message: string}) => void} cb
    * @returns {() => void} 退订函数
    */
   onUpdateProgress: (cb) => {
