@@ -21,7 +21,6 @@ from typing import Any, Dict, Optional, Generator, List, Set
 
 import adbutils
 from engine.adb_scan import ensure_server_started, resolve_adb_binary
-from engine.core.device_agents.protocol import parse_tunnel_serial
 from engine.core.device_transport_metrics import device_transport_metrics
 from .recorder import ReplayCaptureResult, RollingScrcpyRecorderSession
 
@@ -57,7 +56,7 @@ DEFAULT_SCRCPY_BITRATE = 8_000_000    # 视频码率 (bps)
 DEFAULT_SCRCPY_MAX_FPS = 60           # 最大帧率
 DEFAULT_SCRCPY_GOP = 1                # I 帧间隔（秒），即 i_frame_interval
 
-# 远程/无线设备（Agent 隧道 127.0.0.1:281xx、无线 adb IP:5555）默认走低延迟档。
+# 远程/无线设备（无线 adb IP:5555 等 ip:port 形态）默认走低延迟档。
 # ADB transport、截图和 UIAutomator 都会与视频竞争同一条网络链路；保持视频在
 # 1Mbps 左右可以避免 TCP 队列积压后把小控制命令一并拖慢。
 DEFAULT_SCRCPY_REMOTE_MAX_SIZE = 800
@@ -84,8 +83,8 @@ SCRCPY_REMOTE_GOP_ENV = "AUTODROID_SCRCPY_REMOTE_GOP"
 # 投屏清晰度档位。运行时可按设备切换（set_stream_profile_override + REST）：
 # - hd（高清）：USB 直插默认档
 # - standard（标准）：手动提升网络设备画质的档位
-# - smooth（流畅）：Agent 隧道设备默认档 —— 跨公网/VPN 弱链路下码率必须
-#   低于可用带宽，否则隧道各段 TCP 队列积压、投屏延迟无界累积；
+# - smooth（流畅）：弱链路（无线 adb / 网络设备）默认档 —— 带宽受限时码率必须
+#   低于可用带宽，否则各段 TCP 队列积压、投屏延迟无界累积；
 #   1 秒 GOP 限制关键帧恢复等待，拥塞后能尽快恢复画面
 STREAM_PROFILE_HD = "hd"
 STREAM_PROFILE_STANDARD = "standard"
@@ -116,7 +115,7 @@ STREAM_PROFILES: Dict[str, Dict[str, int]] = {
 _stream_profile_overrides: Dict[str, str] = {}
 _stream_profile_lock = threading.Lock()
 
-# ip:port / host:port 形态 serial（无线 adb / 隧道设备），非本机 USB 直插
+# ip:port / host:port 形态 serial（无线 adb 等网络设备），非本机 USB 直插
 _NETWORK_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
 
 SCRCPY_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT = 2
@@ -200,11 +199,6 @@ def is_remote_serial(serial: str) -> bool:
     return bool(_NETWORK_SERIAL_RE.match(str(serial or "")) and ":" in str(serial or ""))
 
 
-def is_tunnel_serial(serial: str) -> bool:
-    """serial 是否为 Agent 反向隧道设备（127.0.0.1:28100-28199）。"""
-    return parse_tunnel_serial(str(serial or "")) is not None
-
-
 def default_stream_profile(serial: str) -> str:
     """按 serial 形态返回默认清晰度档位。"""
     key = str(serial or "").strip()
@@ -265,8 +259,6 @@ def get_scrcpy_stream_params(serial: str = "") -> Dict[str, int]:
         override = _stream_profile_overrides.get(key)
     if override in STREAM_PROFILES:
         return dict(STREAM_PROFILES[override])
-    if is_tunnel_serial(key):
-        return dict(STREAM_PROFILES[STREAM_PROFILE_SMOOTH])
     if is_remote_serial(key):
         return {
             "max_size": _stream_param_from_env(SCRCPY_REMOTE_MAX_SIZE_ENV, DEFAULT_SCRCPY_REMOTE_MAX_SIZE),

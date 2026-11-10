@@ -33,11 +33,11 @@ def _fallback_android_override(step_item: Dict[str, Any]) -> Optional[Dict[str, 
 
 
 def _args_locator_candidates(step_item: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Read inspection-generated fallback locators without widening overrides.
+    """Read args-carried fallback locators without widening overrides.
 
     ``platform_overrides`` deliberately remains a strict, single-locator
-    contract.  Model inspection paths need several ordered semantic locators,
-    so they live in ``args.locator_candidates`` instead.
+    contract.  Steps that need several ordered semantic locators carry them
+    in ``args.locator_candidates`` instead.
     """
     args = step_item.get("args") or {}
     if not isinstance(args, dict):
@@ -132,10 +132,10 @@ def resolve_locator_candidates(step_item: Dict[str, Any], platform: str) -> List
 
     direct = _normalize_override(overrides.get(platform_lower))
     explicit_android = _normalize_override(overrides.get("android"))
-    inspection_candidates = _args_locator_candidates(step_item)
+    args_candidates = _args_locator_candidates(step_item)
     legacy_android = _fallback_android_override(step_item)
     android = explicit_android or (
-        inspection_candidates[0] if inspection_candidates else legacy_android
+        args_candidates[0] if args_candidates else legacy_android
     )
 
     if direct:
@@ -152,8 +152,8 @@ def resolve_locator_candidates(step_item: Dict[str, Any], platform: str) -> List
         return [direct]
 
     if platform_lower == "android":
-        if inspection_candidates:
-            return inspection_candidates
+        if args_candidates:
+            return args_candidates
         return [legacy_android] if legacy_android else []
     if platform_lower == "ios":
         return _infer_ios_candidates_from_android(android)

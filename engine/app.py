@@ -62,6 +62,10 @@ DEVICE_DISCOVERY_INTERVAL_SECONDS = 10.0
 # 视为未知，不再覆盖云端状态
 LOCAL_PRESENCE_REFRESH_SECONDS = 5.0
 LOCAL_PRESENCE_MAX_AGE_SECONDS = 30.0
+# 引擎常驻刷新本机在场缓存的周期：即使长时间没人访问设备列表，缓存也不过期。
+# 这是「长时间静止后跑测试报设备离线」的根治点——三个测试页只查 /api/fastbot/devices，
+# 不带刷新动作，缓存一过期覆盖就失效、只剩云端心跳超时的 OFFLINE。
+LOCAL_PRESENCE_LOOP_SECONDS = 10.0
 # 本机在场却被云端判 OFFLINE 时补发心跳的节流窗口
 PRESENCE_HEAL_INTERVAL_SECONDS = 10.0
 
@@ -107,6 +111,16 @@ def _auth_headers(request: Request) -> Dict[str, str]:
         if value:
             headers[key] = value
     return headers
+
+
+def request_bearer_token(request: Request) -> Optional[str]:
+    """从请求头摘出 Bearer token（无 Authorization / 非 Bearer 返回 None）。"""
+    raw = str(request.headers.get("authorization") or "").strip()
+    scheme, _, value = raw.partition(" ")
+    if scheme.strip().lower() != "bearer":
+        return None
+    token = value.strip()
+    return token or None
 
 
 def _list_devices_payload(data: Any) -> Optional[List[Dict[str, Any]]]:
@@ -198,10 +212,19 @@ def create_app() -> FastAPI:
         app.state.device_discovery = {"ts": 0.0, "serials": set(), "task": None}
         # 设备发现轮次互斥锁：同一时刻至多一轮扫描/上报（不叠轮）
         app.state.device_discovery_lock = asyncio.Lock()
-        # 本机 adb 在场缓存（ts=上次刷新成功时刻，attempt_ts=上次尝试时刻）
-        app.state.local_presence = {"ts": 0.0, "attempt_ts": 0.0, "serials": set(), "task": None}
+        # 本机 adb 在场缓存（ts=上次刷新成功时刻，attempt_ts=上次尝试时刻，loop_task=常驻刷新）
+        app.state.local_presence = {
+            "ts": 0.0,
+            "attempt_ts": 0.0,
+            "serials": set(),
+            "task": None,
+            "loop_task": None,
+        }
         app.state.presence_heal = {"ts": 0.0, "task": None}
         app.state.http = httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=False)
+        # 在场缓存常驻刷新：长时间静止（没人查设备列表）时缓存也不过期，
+        # 否则测试页只查 /api/fastbot/devices，覆盖会随缓存过期而失效
+        app.state.start_local_presence_loop()
         runner_service.broker.bind_loop(asyncio.get_running_loop())
         # 定时任务本地调度（P3-1）：引擎存活期本地 APScheduler 触发；登录后/周期重拉
         try:
@@ -221,9 +244,10 @@ def create_app() -> FastAPI:
             # 进程退出/托盘退出（SIGTERM → lifespan shutdown）时 best-effort
             # 把本实例登记的设备置 OFFLINE，再停心跳、关设备流、关 HTTP 客户端。
             for background in (app.state.device_discovery, app.state.local_presence, app.state.presence_heal):
-                task = background.get("task")
-                if task is not None and not task.done():
-                    task.cancel()
+                for key in ("task", "loop_task"):
+                    task = background.get(key)
+                    if task is not None and not task.done():
+                        task.cancel()
             try:
                 await presence.logout_once(
                     app.state.http, client_instance_id=config_store.get_client_instance_id()
@@ -445,6 +469,21 @@ def create_app() -> FastAPI:
         state["serials"] = set(found)
         state["ts"] = time.monotonic()
 
+    def _adopt_request_identity(request: Request) -> None:
+        """请求带 Bearer 而引擎还没认领身份时接管之，并把心跳循环拉起来。
+
+        身份此前只在登录 POST 里摘一次：引擎进程一旦重启（壳会自动拉起）或窗口重载，
+        内存 token 就没了、心跳循环也不会再启动，云端按 last_seen 超时把设备翻成
+        OFFLINE，而渲染层照常带 token 请求、界面看不出异常——表现为「放久了设备离线」。
+        设备类请求天然带请求方身份，就地认领即可自愈。
+        """
+        token = request_bearer_token(request)
+        if not token:
+            return
+        if presence.get_token() != token:
+            presence.set_token(token)
+        presence.start_heartbeat_loop(app.state.http)
+
     def _schedule_local_presence_refresh() -> None:
         """后台刷新本机 adb 在场缓存（轻量 `adb devices`，至多 5s 一次、不叠跑）。"""
         state = app.state.local_presence
@@ -455,6 +494,33 @@ def create_app() -> FastAPI:
             return
         state["attempt_ts"] = time.monotonic()
         state["task"] = asyncio.create_task(_refresh_local_presence())
+
+    async def _presence_refresh_loop() -> None:
+        """常驻刷新本机在场缓存：不依赖任何请求，长时间静止也不会过期。"""
+        while True:
+            try:
+                await asyncio.sleep(LOCAL_PRESENCE_LOOP_SECONDS)
+                _schedule_local_presence_refresh()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("本机在场常驻刷新异常（继续运行）", exc_info=True)
+
+    def start_local_presence_loop() -> None:
+        """启动在场缓存常驻刷新（幂等）。"""
+        state = app.state.local_presence
+        task = state.get("loop_task")
+        if task is not None and not task.done():
+            return
+        state["loop_task"] = asyncio.create_task(_presence_refresh_loop())
+
+    def stop_local_presence_loop() -> None:
+        task = app.state.local_presence.get("loop_task")
+        if task is not None and not task.done():
+            task.cancel()
+
+    app.state.start_local_presence_loop = start_local_presence_loop
+    app.state.stop_local_presence_loop = stop_local_presence_loop
 
     def _local_presence_snapshot() -> Optional[set]:
         """本机在场 serial 集合；缓存过期（adb 卡住/缺失）返回 None 表示未知。"""
@@ -501,6 +567,7 @@ def create_app() -> FastAPI:
         upstream = require_upstream()
         if not upstream:
             return _upstream_missing()
+        _adopt_request_identity(request)
         auth_headers = _auth_headers(request)
         _schedule_device_discovery(auth_headers, upstream)
         _schedule_local_presence_refresh()
@@ -549,16 +616,23 @@ def create_app() -> FastAPI:
         """稳定性测试的设备列表：回源后覆盖本机在场与本机占用（跑测中 / 执行中）。
 
         云端只知道它自己跑的任务；客户端本机跑的稳定性测试，云端仍报「空闲」。
+        智能稳定性 / 流畅度 / 冷热启动三页只走这个端点，与 /api/devices/ 同等对待：
+        同样刷新在场缓存、同样按本机在场补心跳（否则长时间静止后只剩云端的
+        「心跳超时 → OFFLINE」，表现为设备离线，要到设备中心刷新才恢复）。
         """
         upstream = require_upstream()
         if not upstream:
             return _upstream_missing()
+        _adopt_request_identity(request)
         auth_headers = _auth_headers(request)
+        _schedule_local_presence_refresh()
         fetched = await _fetch_upstream_device_list(request, upstream, "/api/fastbot/devices", auth_headers)
         if isinstance(fetched, Response):
             return fetched
         data, devices = fetched
-        overlay_local_presence(devices, _local_presence_snapshot())
+        revived = overlay_local_presence(devices, _local_presence_snapshot())
+        if revived:
+            _schedule_presence_heal(auth_headers, revived)
         device_busy.overlay(devices)
         return JSONResponse(content=data)
 

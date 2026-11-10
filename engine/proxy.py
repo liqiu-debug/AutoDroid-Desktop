@@ -3,6 +3,7 @@
 - 请求体 / 响应体均为流式转发，不整体缓冲；
 - 剥离 hop-by-hop 头，Host 由 httpx 按 upstream 重算；
 - Content-Encoding（gzip 等）原样透传：响应使用 iter_raw，不做解压；
+- 响应保留上游 content-length（原样字节转发，长度一致），下载类请求才能算进度；
 - Authorization 等业务头原样透传（含多值头，如 set-cookie）；
 - 反代超时分级：普通 API 短读超时快速失败，流式/上传等长请求保留长超时；
 - 客户端断连（request.is_disconnected / 通道关闭）时取消上游请求与读取，
@@ -22,7 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
-# RFC 2616 hop-by-hop 头 + 由代理重算的头（content-length 走 chunked 转发）
+# RFC 2616 hop-by-hop 头 + 由代理重算的头（请求侧 content-length 由 httpx 重算）
 HOP_BY_HOP: FrozenSet[str] = frozenset(
     {
         "connection",
@@ -39,6 +40,22 @@ HOP_BY_HOP: FrozenSet[str] = frozenset(
 )
 
 HeaderList = List[Tuple[str, str]]
+
+# 响应侧保留上游 content-length：响应体经 aiter_raw 原样字节转发（不解压、不改写），
+# 转发字节数与上游声明一致。去掉它会让下游一律收到 chunked 响应——壳内更新下载器
+# 拿不到总长，进度恒为 0%，也没法按总长校验完整性。
+RESPONSE_HOP_BY_HOP: FrozenSet[str] = HOP_BY_HOP - {"content-length"}
+
+# 无响应体的状态码：长度头交给 ASGI 服务器按规范处理，不透传
+_NO_BODY_STATUS: FrozenSet[int] = frozenset({204, 304})
+
+
+def response_drop_headers(status_code: int) -> FrozenSet[str]:
+    """反代响应需剔除的头：有响应体时保留 content-length，无响应体时一并剔除。"""
+    if status_code < 200 or status_code in _NO_BODY_STATUS:
+        return HOP_BY_HOP
+    return RESPONSE_HOP_BY_HOP
+
 
 # 客户端模式专有头：只允许本地引擎读取（login 分支显式读取后剥离），
 # 一律不得透传给上游，防 upstream 侧被注入/混淆服务器地址。
@@ -211,7 +228,10 @@ async def proxy_request(
         send_task.cancel()
         raise
 
-    response_headers = filter_headers(upstream_response.headers.items(), HOP_BY_HOP | drop_response_headers)
+    response_headers = filter_headers(
+        upstream_response.headers.items(),
+        response_drop_headers(upstream_response.status_code) | drop_response_headers,
+    )
 
     async def _body() -> AsyncIterator[bytes]:
         try:

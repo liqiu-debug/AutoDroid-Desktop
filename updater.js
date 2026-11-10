@@ -140,9 +140,14 @@ function isRetryableStatus(status) {
  * 传输中断/5xx 自动重试：只要每轮仍有字节进展就继续（隧道 ~100s 掐断大文件靠这个
  * 续完）；连续 MAX_STALLED_ATTEMPTS 轮零进展或达到 MAX_DOWNLOAD_ATTEMPTS 才放弃。
  * 完成后按「总字节数」校验完整性（expectedSize 可选，来源可信时作为硬校验）。
+ *
+ * 进度回调 onProgress({ percent, received, total })：percent 为 0..100，总长未知时为 null
+ * （调用方改显示已下载字节）。sizeHint 是近似总长（如包管理按 MB 记录的大小），只在服务端
+ * 没声明总长时用来估算百分比，不参与完整性校验。下载完成后补发一次 100%。
  */
 async function downloadWithResume(url, dest, options = {}) {
   const expectedSize = Number(options.expectedSize) || 0
+  const sizeHint = Number(options.sizeHint) || 0
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {}
   const partPath = partPathFor(dest)
   fs.mkdirSync(path.dirname(dest), { recursive: true })
@@ -165,7 +170,7 @@ async function downloadWithResume(url, dest, options = {}) {
     lastSize = offset
     if (stalled >= MAX_STALLED_ATTEMPTS) break
     try {
-      const total = await downloadOnce(url, partPath, offset, onProgress)
+      const total = await downloadOnce(url, partPath, offset, onProgress, { expectedSize, sizeHint })
       const size = fs.statSync(partPath).size
       const expected = expectedSize || total
       if (expected > 0 && size !== expected) {
@@ -176,6 +181,8 @@ async function downloadWithResume(url, dest, options = {}) {
         throw new Error(`下载不完整（${size}/${expected} 字节）`)
       }
       fs.renameSync(partPath, dest)
+      // 节流可能吞掉最后几块的进度；macOS 之后还要挂载校验暂存几秒，先把进度落到 100%
+      onProgress({ percent: 100, received: size, total: size })
       return { size }
     } catch (error) {
       lastError = error
@@ -188,8 +195,28 @@ async function downloadWithResume(url, dest, options = {}) {
   throw lastError || new Error('下载失败')
 }
 
+/**
+ * 进度百分比用的总长：服务端声明（content-range / 200 的 content-length）优先；206 没有可解析的
+ * content-range 时按「续传起点 + 本段长度」推算；都没有（响应被转成 chunked）时退到调用方给的
+ * 精确大小，再退到近似大小（estimated：只做估算，真正下完前不显示 100%）。
+ */
+function resolveProgressTotal({ declaredTotal, status, offset, contentLength, expectedSize, sizeHint }) {
+  if (declaredTotal > 0) return { total: declaredTotal, estimated: false }
+  if (status === 206 && contentLength > 0) return { total: offset + contentLength, estimated: false }
+  if (expectedSize > 0) return { total: expectedSize, estimated: false }
+  if (sizeHint > 0) return { total: sizeHint, estimated: true }
+  return { total: 0, estimated: false }
+}
+
+/** 下载百分比：总长未知返回 null；近似总长封顶 99（以免没下完就显示 100%）。 */
+function progressPercent(received, total, estimated) {
+  if (!(total > 0)) return null
+  const percent = Math.round((received / total) * 100)
+  return Math.min(estimated ? 99 : 100, Math.max(0, percent))
+}
+
 // 单次下载尝试：返回服务端声明的总字节数（0=未知），失败抛错并标记是否可续传重试
-function downloadOnce(url, partPath, offset, onProgress) {
+function downloadOnce(url, partPath, offset, onProgress, sizes = {}) {
   return new Promise((resolve, reject) => {
     const headers = offset > 0 ? { range: `bytes=${offset}-` } : {}
     getResponse(url, MAX_REDIRECTS, headers).then((res) => {
@@ -216,6 +243,14 @@ function downloadOnce(url, partPath, offset, onProgress) {
       const contentLength = Number(res.headers['content-length']) || 0
       const total = rangeTotal ? Number(rangeTotal[1]) : (status === 200 ? contentLength : 0)
       const restart = status === 200 && offset > 0
+      const progress = resolveProgressTotal({
+        declaredTotal: total,
+        status,
+        offset: restart ? 0 : offset,
+        contentLength,
+        expectedSize: Number(sizes.expectedSize) || 0,
+        sizeHint: Number(sizes.sizeHint) || 0,
+      })
       const writePath = partPath
       let writable
       try {
@@ -241,8 +276,11 @@ function downloadOnce(url, partPath, offset, onProgress) {
         const now = Date.now()
         if (now - lastEmit >= PROGRESS_THROTTLE_MS) {
           lastEmit = now
-          const percent = total > 0 ? Math.min(100, Math.max(0, Math.round((received / total) * 100))) : 0
-          onProgress(percent)
+          onProgress({
+            percent: progressPercent(received, progress.total, progress.estimated),
+            received,
+            total: progress.total,
+          })
         }
       })
       res.on('error', (error) => {
@@ -625,7 +663,7 @@ function defaultLaunchInstaller(filePath, payload = {}, emit = () => {}) {
 
 // ==================== 下载 + 安装主流程 ====================
 
-// payload：{ url, fileName, version, expectedSize?, autoInstall? }
+// payload：{ url, fileName, version, expectedSize?, sizeHint?, autoInstall? }
 async function installUpdate(sender, payload, launchInstaller) {
   const data = payload && typeof payload === 'object' ? payload : {}
   const url = data.url
@@ -653,7 +691,8 @@ async function installUpdate(sender, payload, launchInstaller) {
     fs.mkdirSync(updatesDir(), { recursive: true })
     await downloadWithResume(url, dest, {
       expectedSize: Number(data.expectedSize) || 0,
-      onProgress: (percent) => emit({ phase: 'downloading', percent }),
+      sizeHint: Number(data.sizeHint) || 0,
+      onProgress: (progress) => emit({ phase: 'downloading', ...progress }),
     })
     downloaded = true
     const result = await launchInstaller(dest, data, emit)
@@ -706,7 +745,8 @@ async function downloadPackage(sender, payload) {
   try {
     const { size } = await downloadWithResume(url, dest, {
       expectedSize: Number(data.expectedSize) || 0,
-      onProgress: (percent) => emit({ phase: 'downloading', percent }),
+      sizeHint: Number(data.sizeHint) || 0,
+      onProgress: (progress) => emit({ phase: 'downloading', ...progress }),
     })
     emit({ phase: 'done', path: dest, size })
     try {

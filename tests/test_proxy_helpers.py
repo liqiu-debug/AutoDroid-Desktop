@@ -27,6 +27,21 @@ def test_filter_headers_strips_hop_by_hop_and_keeps_auth():
     assert not any(k.lower() in HOP_BY_HOP for k, _ in kept)
 
 
+def test_response_drop_headers_keeps_content_length_only_with_body():
+    """响应侧：有响应体时保留 content-length（下载进度/完整性靠它），无响应体状态码一并剔除。"""
+    from engine.proxy import response_drop_headers
+
+    headers = [("Content-Length", "10"), ("Transfer-Encoding", "chunked"), ("Content-Range", "bytes 0-9/10")]
+    for status in (200, 206, 404, 500):
+        kept = filter_headers(headers, response_drop_headers(status))
+        assert ("Content-Length", "10") in kept, status
+        assert ("Content-Range", "bytes 0-9/10") in kept, status
+        assert not any(k.lower() == "transfer-encoding" for k, _ in kept), status
+    for status in (101, 204, 304):
+        kept = filter_headers(headers, response_drop_headers(status))
+        assert not any(k.lower() == "content-length" for k, _ in kept), status
+
+
 def test_count_online_matches_backend_semantics():
     devices = [
         {"status": "IDLE"},
@@ -247,6 +262,34 @@ def test_proxy_request_passes_tiered_timeout_to_httpx():
                 await proxy_request(http, _FakeRequest(path="/api/stream/devices"), upstream.base_url)
                 assert captured[0] is NORMAL_TIMEOUT
                 assert captured[1] is LONG_TIMEOUT
+        finally:
+            upstream.stop()
+
+    asyncio.run(_run())
+
+
+def test_proxy_request_keeps_upstream_content_length():
+    """流式反代保留上游 content-length（原样字节转发），下游下载器才能算进度。"""
+    import asyncio
+
+    import httpx
+
+    from engine.proxy import proxy_request
+
+    async def _run():
+        upstream = _ScriptedUpstream(chunks=8, chunk_delay=0.0)
+        upstream.start()
+        try:
+            async with httpx.AsyncClient() as http:
+                resp = await proxy_request(http, _FakeRequest(path="/chunked"), upstream.base_url)
+                assert resp.status_code == 200
+                headers = {k.decode().lower(): v.decode() for k, v in resp.raw_headers}
+                assert headers.get("content-length") == str(8 * 4)
+                assert "transfer-encoding" not in headers
+                body = b""
+                async for chunk in resp.body_iterator:
+                    body += chunk
+                assert len(body) == 8 * 4
         finally:
             upstream.stop()
 
