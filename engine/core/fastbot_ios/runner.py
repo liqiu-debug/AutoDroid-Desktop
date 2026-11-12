@@ -73,6 +73,7 @@ def run_ios_fastbot_local(
     host = wda_registry.get(udid) if shared_host else host_factory(udid)
     session: Optional[WdaSession] = None
     recorder: Optional[MjpegReplayRecorder] = None
+    replay_error: Optional[str] = None
     sampler: Optional[ios_perf.PerfSampler] = None
     crash_events: List[Dict[str, Any]] = []
     perf_data: List[Dict[str, Any]] = []
@@ -109,8 +110,14 @@ def run_ios_fastbot_local(
         else:
             degraded.append("crash_log")
         if enable_local_replay:
-            recorder = MjpegReplayRecorder(host.mjpeg_port, os.path.join(work_dir, "replays"))
-            recorder.start()
+            try:
+                recorder = MjpegReplayRecorder(host.mjpeg_port, os.path.join(work_dir, "replays"))
+                recorder.start()
+            except Exception as exc:
+                # 与 Android 轻量档同口径：录制起不来只降级，不让整轮稳定性测试陪葬
+                recorder = None
+                replay_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("启动异常回放录制失败，本次报告无崩溃回放: %s", exc)
         if enable_performance_monitor:
             sampler = ios_perf.PerfSampler(udid, bundle_id, perf_data)  # 内部复用可执行名查询
             if sampler.available:
@@ -276,14 +283,25 @@ def run_ios_fastbot_local(
     total_oom = sum(1 for e in crash_events if e.get("type") == "OOM")
     # Jetsam 被杀同样是用户可感知的闪退：计入崩溃总数，另列 total_oom
     summary["total_crashes"] = int(summary.get("total_crashes") or 0) + total_oom
+    # 回放状态口径对齐 Android 轻量档（on / disabled / not_ready / error）：
+    # iOS 没有「设备流就绪」这道门，故不会出现 not_ready
+    if not enable_local_replay:
+        replay_status = "disabled"
+    elif recorder is not None:
+        replay_status = "on"
+    else:
+        replay_status = "error"
     summary.update({
         "platform": "ios",
         "bundle_id": bundle_id,
         "local_replay_enabled": recorder is not None,
+        "local_replay_status": replay_status,
         "degraded": degraded,
         "ios_stats": stats,
         "total_oom": total_oom,
     })
+    if replay_error:  # 健康时不留噪音字段
+        summary["local_replay_error"] = replay_error
     if aborted_reason:
         summary["aborted_reason"] = aborted_reason
     return {

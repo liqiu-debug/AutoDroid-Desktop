@@ -136,12 +136,40 @@ def test_run_fastbot_local_light_profile_report_shape(fake_collection):
 
 # --------------------------- 异常回放（本地滚动录制） --------------------------- #
 
+@pytest.fixture(autouse=True)
+def _fast_replay_ready_budget(monkeypatch):
+    """设备流就绪等待压到毫秒级：走完整等待/超时路径，但测试不真等 8 秒。"""
+    monkeypatch.setattr(fastbot_service, "LOCAL_REPLAY_READY_WAIT_SEC", 0.6)
+    monkeypatch.setattr(fastbot_service, "LOCAL_REPLAY_READY_POLL_SEC", 0.01)
+
+
+def _is_ready_script(monkeypatch, results: List[bool]) -> List[str]:
+    """device_manager.is_ready 替身：按脚本返回（末值重复），返回探测记录。"""
+    from engine.core.device_stream.manager import device_manager
+
+    pending = list(results)
+    probes: List[str] = []
+
+    def _probe(serial: str) -> bool:
+        probes.append(serial)
+        return pending.pop(0) if pending else results[-1]
+
+    monkeypatch.setattr(device_manager, "is_ready", _probe)
+    return probes
+
+
 @pytest.fixture()
 def fake_recorder(monkeypatch):
-    """device_manager 录制替身：记录 start/capture/stop 入参，capture 返回就绪产物。"""
+    """device_manager 录制替身：设备流已就绪，记录 start/capture/stop 入参。
+
+    就绪探测也替身掉：录制可用就意味着设备流就绪，用例要考「晚到」时自己再覆盖 is_ready。
+    """
     from engine.core.device_stream.manager import device_manager
 
     calls: Dict[str, Any] = {}
+
+    def _is_ready(serial: str) -> bool:
+        return True
 
     def _start(serial, task_id, report_dir, pre_roll_sec=30, post_roll_sec=5, segment_sec=5):
         calls["start"] = {
@@ -168,6 +196,7 @@ def fake_recorder(monkeypatch):
     def _stop(serial):
         calls.setdefault("stop", []).append(serial)
 
+    monkeypatch.setattr(device_manager, "is_ready", _is_ready)
     monkeypatch.setattr(device_manager, "start_recording", _start)
     monkeypatch.setattr(device_manager, "capture_replay", _capture)
     monkeypatch.setattr(device_manager, "stop_recording", _stop)
@@ -197,6 +226,7 @@ def test_run_fastbot_local_records_replay_and_marks_enabled(
     result = _run_local(monkeypatch, tmp_path)
     summary = result["summary"]
     assert summary["local_replay_enabled"] is True
+    assert summary["local_replay_status"] == "on"
     # 已实现的回放不再计入降级项（jank 帧监控 / perfetto 仍未覆盖）
     assert summary["degraded"] == ["jank_frame_monitor", "perfetto"]
 
@@ -214,36 +244,113 @@ def test_run_fastbot_local_records_replay_and_marks_enabled(
     assert fake_recorder["stop"] == ["USB1"]
 
 
-def test_run_fastbot_local_replay_unavailable_degrades(
-    fake_collection, tmp_path, monkeypatch
+def test_run_fastbot_local_replay_waits_for_stream_then_starts(
+    fake_collection, fake_recorder, tmp_path, monkeypatch
 ):
-    """录制起不来（设备流未就绪等）时如实降级，不伪造回放。"""
-    from engine.core.device_stream.manager import device_manager
-
-    def _boom(*args, **kwargs):
-        raise ValueError("设备 USB1 未就绪")
-
-    monkeypatch.setattr(device_manager, "start_recording", _boom)
+    """设备流晚到几百毫秒是常态（实测两任务 80ms 内同时起跑）：等就绪再启动，不误降级。"""
+    probes = _is_ready_script(monkeypatch, [False, False, True])
     result = _run_local(monkeypatch, tmp_path)
-    assert result["summary"]["local_replay_enabled"] is False
-    assert result["summary"]["degraded"] == [
+    summary = result["summary"]
+    assert summary["local_replay_enabled"] is True
+    assert summary["local_replay_status"] == "on"
+    assert "local_replay_error" not in summary
+    assert summary["degraded"] == ["jank_frame_monitor", "perfetto"]
+    assert len(probes) == 3, "应按轮询等到就绪，而不是第一次没 ready 就直接降级"
+    assert fake_recorder["start"]["serial"] == "USB1"
+    assert "replay" in result["crash_events"][0]
+
+
+def test_run_fastbot_local_replay_stream_never_ready_degrades(
+    fake_collection, fake_recorder, tmp_path, monkeypatch
+):
+    """设备流一直没就绪：有界等待到点如实降级（not_ready），绝不半路启动录制。"""
+    probes = _is_ready_script(monkeypatch, [False])
+    result = _run_local(monkeypatch, tmp_path)
+    summary = result["summary"]
+    assert summary["local_replay_enabled"] is False
+    assert summary["local_replay_status"] == "not_ready"
+    assert summary["local_replay_error"], "降级原因必须落进 local_replay_error"
+    assert "USB1" in summary["local_replay_error"]
+    assert summary["degraded"] == [
         "jank_frame_monitor", "local_replay", "perfetto",
     ]
+    assert len(probes) >= 2, "应在等待预算内轮询，而不是只探测一次"
+    assert "start" not in fake_recorder, "设备流未就绪时不得启动录制"
     assert fake_collection["logcat_kwargs"]["replay_callback"] is None
     assert "replay" not in result["crash_events"][0]
 
 
+def test_run_fastbot_local_replay_start_failure_marks_error(
+    fake_collection, fake_recorder, tmp_path, monkeypatch
+):
+    """录制启动抛出非「未就绪」异常：归 error，原因进 local_replay_error。"""
+    from engine.core.device_stream.manager import device_manager
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("scrcpy 码流通道打不开")
+
+    monkeypatch.setattr(device_manager, "start_recording", _boom)
+    result = _run_local(monkeypatch, tmp_path)
+    summary = result["summary"]
+    assert summary["local_replay_enabled"] is False
+    assert summary["local_replay_status"] == "error"
+    assert "scrcpy 码流通道打不开" in summary["local_replay_error"]
+    assert summary["degraded"] == [
+        "jank_frame_monitor", "local_replay", "perfetto",
+    ]
+
+
+def test_run_fastbot_local_replay_late_not_ready_stays_not_ready(
+    fake_collection, fake_recorder, tmp_path, monkeypatch
+):
+    """就绪检查后的竞态（DeviceNotReadyError）仍算 not_ready，不算故障。"""
+    from engine.core.device_stream.manager import DeviceNotReadyError, device_manager
+
+    def _late(serial, *args, **kwargs):
+        raise DeviceNotReadyError(f"设备 {serial} 未就绪")
+
+    monkeypatch.setattr(device_manager, "start_recording", _late)
+    result = _run_local(monkeypatch, tmp_path)
+    summary = result["summary"]
+    assert summary["local_replay_enabled"] is False
+    assert summary["local_replay_status"] == "not_ready"
+    assert "未就绪" in summary["local_replay_error"]
+
+
 def test_run_fastbot_local_replay_opt_out_stays_quiet(fake_collection, tmp_path, monkeypatch):
-    """用户关掉开关：不启动录制，也不标注降级（不是"请求了但没做"）。"""
+    """用户关掉开关：不启动录制也不查设备流，且不标注降级（不是"请求了但没做"）。"""
     from engine.core.device_stream.manager import device_manager
 
     def _unexpected(*args, **kwargs):
-        raise AssertionError("关闭异常回放时不应启动录制")
+        raise AssertionError("关闭异常回放时不应启动录制/查询设备流")
 
     monkeypatch.setattr(device_manager, "start_recording", _unexpected)
+    monkeypatch.setattr(device_manager, "is_ready", _unexpected)
     result = _run_local(monkeypatch, tmp_path, enable_local_replay=False)
     assert result["summary"]["local_replay_enabled"] is False
+    assert result["summary"]["local_replay_status"] == "disabled"
+    assert "local_replay_error" not in result["summary"]
     assert result["summary"]["degraded"] == ["jank_frame_monitor", "perfetto"]
+
+
+def test_run_fastbot_local_summary_replay_fields_keep_legacy_format(
+    fake_collection, fake_recorder, tmp_path, monkeypatch
+):
+    """local_replay_enabled / degraded 的语义与格式一个字都不能变：前端按这两个字段渲染。"""
+    started = _run_local(monkeypatch, tmp_path)["summary"]
+    assert started["local_replay_enabled"] is True
+    assert isinstance(started["local_replay_enabled"], bool)
+    assert started["degraded"] == ["jank_frame_monitor", "perfetto"]
+
+    opted_out = _run_local(monkeypatch, tmp_path, enable_local_replay=False)["summary"]
+    assert opted_out["local_replay_enabled"] is False
+    assert opted_out["degraded"] == ["jank_frame_monitor", "perfetto"]
+
+    _is_ready_script(monkeypatch, [False])
+    degraded = _run_local(monkeypatch, tmp_path)["summary"]
+    assert degraded["local_replay_enabled"] is False
+    assert degraded["degraded"] == ["jank_frame_monitor", "local_replay", "perfetto"]
+    assert all(isinstance(name, str) for name in degraded["degraded"])
 
 
 # --------------------------- 回放产物上传 --------------------------- #
@@ -670,6 +777,41 @@ def test_fastbot_run_requires_local_device(client, mock_cloud, local_device):
     )
     assert resp.status_code == 400
     assert "设备不在线或未就绪" in resp.json()["detail"]
+
+
+# --------------------------- 引擎日志落盘 --------------------------- #
+
+def test_engine_file_logging_writes_rotating_log(tmp_path, monkeypatch):
+    """引擎日志落盘 userData/logs/engine.log：stderr 在 Electron 侧被丢掉，事后要能查现场。"""
+    import logging as logging_mod
+
+    from engine import __main__ as engine_main
+
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
+    handler = engine_main._setup_file_logging()
+    assert handler is not None
+    try:
+        logging_mod.getLogger("engine.test").warning("启动异常回放录制失败，本次报告无崩溃回放: boom")
+        for item in list(logging_mod.getLogger().handlers):
+            item.flush()
+        log_file = tmp_path / "userdata" / "logs" / "engine.log"
+        assert log_file.is_file(), "日志目录不存在时应自建"
+        assert "启动异常回放录制失败" in log_file.read_text(encoding="utf-8")
+    finally:
+        logging_mod.getLogger().removeHandler(handler)
+        handler.close()
+
+
+def test_engine_file_logging_degrades_to_stderr_only(tmp_path, monkeypatch, capsys):
+    """日志目录建不出来只告警，绝不挡住引擎启动。"""
+    from engine import __main__ as engine_main
+
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("AUTODROID_USER_DATA", str(blocked))
+    handler = engine_main._setup_file_logging()
+    assert handler is None
+    assert "引擎日志落盘不可用" in capsys.readouterr().err
 
 
 # --------------------------- 契约漂移锁 --------------------------- #

@@ -187,9 +187,10 @@ def _run(fake_wda, monkeypatch, tmp_path, script, reports, duration=0.3, **kw):
     monkeypatch.setattr(ios_crash.CrashCollector, "collect_new",
                         lambda self, b, n, w: next(pulls, []))
     monkeypatch.setattr(ios_crash, "which", lambda name: "/bin/true")
+    kw.setdefault("enable_local_replay", False)  # 默认不录制，回放用例自己打开（替身 MJPEG）
     return ios_runner.run_ios_fastbot_local(
         device_serial=SERIAL, bundle_id="com.demo.app", duration=duration,
-        enable_local_replay=False, report_dir=str(tmp_path), host_factory=fake_wda, **kw)
+        report_dir=str(tmp_path), host_factory=fake_wda, **kw)
 
 
 def test_crash_detected_and_stops_without_ignore(fake_wda, monkeypatch, tmp_path):
@@ -236,6 +237,67 @@ def test_perf_degraded_when_tool_missing(fake_wda, monkeypatch, tmp_path):
     monkeypatch.setattr(ios_perf, "resolve_pymobiledevice3", lambda: None)
     report = _run(fake_wda, monkeypatch, tmp_path, [], [], enable_performance_monitor=True)
     assert "performance_monitor" in report["summary"]["degraded"]
+
+
+class FakeReplayRecorder:
+    """MjpegReplayRecorder 替身：不连 MJPEG 端口（测试不碰网络）。"""
+
+    started = 0
+    stopped = 0
+
+    def __init__(self, port, replay_dir):
+        self.port = port
+        self.replay_dir = replay_dir
+        self.frames_received = 0
+
+    def start(self):
+        FakeReplayRecorder.started += 1
+
+    def stop(self):
+        FakeReplayRecorder.stopped += 1
+
+    def capture(self, event_type, event_time, event_mono=None):
+        return {"status": "READY", "filename": "crash_t.mp4"}
+
+
+def test_replay_status_on_when_recorder_started(fake_wda, monkeypatch, tmp_path):
+    """回放状态口径对齐 Android 轻量档：录上了记 on，且不写 local_replay_error。"""
+    info = {"file": "a.ips", "bug_type": "309", "bundle_id": "com.demo.app",
+            "exception": {"type": "EXC_BAD_ACCESS"}, "termination": {}}
+    FakeReplayRecorder.started = FakeReplayRecorder.stopped = 0
+    monkeypatch.setattr(ios_runner, "MjpegReplayRecorder", FakeReplayRecorder)
+    report = _run(fake_wda, monkeypatch, tmp_path, [4, 4, 1], [[info]],
+                  ignore_crashes=True, enable_local_replay=True)
+    summary = report["summary"]
+    assert summary["local_replay_enabled"] is True
+    assert summary["local_replay_status"] == "on"
+    assert "local_replay_error" not in summary
+    assert report["crash_events"][0]["replay"]["status"] == "READY"
+    assert FakeReplayRecorder.started == 1 and FakeReplayRecorder.stopped == 1
+
+
+def test_replay_status_error_when_recorder_fails(fake_wda, monkeypatch, tmp_path):
+    """录制起不来只降级（口径同 Android 轻量档），不让整轮稳定性测试陪葬。"""
+
+    class BrokenRecorder:
+        def __init__(self, port, replay_dir):
+            raise OSError("mjpeg 端口连不上")
+
+    monkeypatch.setattr(ios_runner, "MjpegReplayRecorder", BrokenRecorder)
+    report = _run(fake_wda, monkeypatch, tmp_path, [4, 1], [[]], enable_local_replay=True)
+    summary = report["summary"]
+    assert summary["local_replay_enabled"] is False
+    assert summary["local_replay_status"] == "error"
+    assert "mjpeg 端口连不上" in summary["local_replay_error"]
+    assert "aborted_reason" not in summary, "回放降级不得中断本轮测试"
+
+
+def test_replay_status_disabled_when_opted_out(fake_wda, monkeypatch, tmp_path):
+    report = _run(fake_wda, monkeypatch, tmp_path, [4, 1], [[]])
+    summary = report["summary"]
+    assert summary["local_replay_enabled"] is False
+    assert summary["local_replay_status"] == "disabled"
+    assert "local_replay_error" not in summary
 
 
 def test_device_scan_union(monkeypatch):
