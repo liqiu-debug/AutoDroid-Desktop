@@ -49,6 +49,20 @@ _FINISH_STATUS_BY_OUTCOME = {
     (False, True): "ABORTED",
 }
 
+# 步骤结果新增纯增量字段 skip_reason 的取值（见 AutoDroid/docs/EXECUTION_SPEC.md 2.2/2.3）：
+# - IGNORE 容忍的失败 → "失败已忽略：<原始 error 文本>"（error 原文不动）；
+# - 中止后补齐的记录 → "上游步骤失败，中止执行" / "用户中止执行"；
+# - 平台跳过（P1001）沿用现状，补记 "平台不匹配"。
+SKIP_REASON_IGNORED_FAILURE = "失败已忽略："
+SKIP_REASON_UPSTREAM_ABORTED = "上游步骤失败，中止执行"
+SKIP_REASON_USER_ABORTED = "用户中止执行"
+SKIP_REASON_PLATFORM_MISMATCH = "平台不匹配"
+
+
+def _ignored_failure_reason(error: Any) -> str:
+    """IGNORE 容忍失败的跳过原因：失败已忽略：<原始 error 文本>（不改动 error 本身）。"""
+    return f"{SKIP_REASON_IGNORED_FAILURE}{'' if error is None else str(error)}"
+
 
 def _resolve_finish_status(status: Optional[str], success: bool, aborted: bool) -> str:
     """显式 status 优先（S2）；缺省按 (success, aborted) 映射。"""
@@ -185,20 +199,26 @@ class LocalRunContext:
     ) -> None:
         if self.run_key is None:
             return
-        steps = [
-            {
-                "order": entry.get("order"),
-                "action": entry.get("action"),
-                "status": entry.get("report_status"),
-                "duration": entry.get("duration"),
-                "attempts": entry.get("attempts") or 1,
-                "error": entry.get("error"),
-                "error_code": entry.get("error_code"),
-                "screenshot_base64": entry.get("screenshot_base64"),
-                "output": entry.get("output"),
-            }
-            for entry in step_entries
-        ]
+        steps = []
+        for entry in step_entries:
+            output = entry.get("output") if isinstance(entry.get("output"), dict) else None
+            skip_reason = str(entry.get("skip_reason") or "").strip()
+            if skip_reason:
+                # 上报协议不改 schema：skip_reason 走 output.skip_reason 透传（纯增量）。
+                output = {**(output or {}), "skip_reason": skip_reason}
+            steps.append(
+                {
+                    "order": entry.get("order"),
+                    "action": entry.get("action"),
+                    "status": entry.get("report_status"),
+                    "duration": entry.get("duration"),
+                    "attempts": entry.get("attempts") or 1,
+                    "error": entry.get("error"),
+                    "error_code": entry.get("error_code"),
+                    "screenshot_base64": entry.get("screenshot_base64"),
+                    "output": output,
+                }
+            )
         # 空步骤批次必须带显式 success（缺省会被 all([])==True 推导为 PASS）：
         # success 形参强制必传，缺省按 False 上报（两侧对齐 DeviceReportCase.success 默认）。
         if success is None:
@@ -254,7 +274,9 @@ class LocalRunContext:
 def case_run_status(step_entries: List[Dict[str, Any]], success: bool, aborted: bool) -> str:
     """用例收尾聚合状态（对齐平台 _determine_case_status 口径，S2）。
 
-    全 SKIP / 仅 IGNORE-WARNING 不落 PASS，落 WARNING（平台聚合口径）。
+    结论只由「未被容忍的失败」决定：IGNORE 失败已记为 SKIP（skip_reason=失败已忽略：…），
+    不计入 has_warning / has_fail，用例判 PASS。全 SKIP（含全部被 IGNORE）仍落 WARNING
+    ——本次没有真正验证到任何内容（既有 all_skipped 口径不变）。
     """
     if aborted:
         return "ABORTED"
@@ -297,6 +319,31 @@ def _capture_screenshot(runner) -> Optional[str]:
         return None
 
 
+def _padded_skip_entry(step: Dict[str, Any], index: int, skip_reason: str) -> Dict[str, Any]:
+    """中止/中断后为「未执行」步骤补的结果记录（不触发 before_step / before_device_step）。
+
+    status=SKIP、duration=0、不截图、error 置 None；目标是结果条数恒等于步骤条数，
+    报告不再把「被截断」伪装成「总共就这么多步」。
+    """
+    raw = step if isinstance(step, dict) else {}
+    return {
+        **_legacy_step_dict(raw),
+        "order": raw.get("order") or (index + 1),
+        "action": raw.get("action"),
+        "status": "skipped",
+        "report_status": "SKIP",
+        "duration": 0,
+        "attempts": 1,
+        "error": None,
+        "error_code": None,
+        "suggestion": None,
+        "output": None,
+        "screenshot_base64": None,
+        "skip_reason": skip_reason,
+        "log": f"↷ 步骤跳过: {skip_reason}",
+    }
+
+
 async def execute_prepared_steps(
     prepared_steps: List[Dict[str, Any]],
     *,
@@ -310,6 +357,11 @@ async def execute_prepared_steps(
 
     单例执行与场景批量执行共用本核心；runner 可复用（场景逐 case 传入同一体）。
     返回 {step_entries, passed, failed, aborted, success, duration, runtime_variables}。
+
+    结果口径（EXECUTION_SPEC 2.2/2.3）：
+    - IGNORE 失败 → 步骤记 SKIP + skip_reason="失败已忽略：<原文>"，error 等留痕不变，不计入 failed；
+    - ABORT 失败 / 用户中止 break 后，剩余步骤各补一条 SKIP 记录（duration=0、error=None），
+      保证 len(step_entries) == len(prepared_steps)。
     """
     loop = asyncio.get_running_loop()
 
@@ -456,7 +508,12 @@ async def execute_prepared_steps(
                 continue
 
             if status == "SKIP":
+                # 平台跳过（P1001）沿用现状，补记 skip_reason
+                skip_reason = (
+                    str(step_result.get("skip_reason") or "").strip() or SKIP_REASON_PLATFORM_MISMATCH
+                )
                 step_entries.append({**entry_common, "status": "skipped", "report_status": "SKIP",
+                                     "skip_reason": skip_reason,
                                      "log": f"↷ 步骤跳过: {error_msg or '平台不匹配'}"})
                 await emit(
                     {
@@ -470,20 +527,46 @@ async def execute_prepared_steps(
                         "error": error_msg,
                         "error_code": error_code,
                         "suggestion": error_suggestion,
+                        "skip_reason": skip_reason,
                     }
                 )
                 continue
 
-            if status == "WARNING" or (status == "FAIL" and strategy == "IGNORE"):
+            if status == "FAIL" and strategy == "IGNORE":
+                # IGNORE 容忍的失败：步骤行记 SKIP（不再是 WARNING），但 error / error_code /
+                # suggestion / 截图原样留痕；结论不计入失败与告警（用例/场景判 PASS）。
+                skip_reason = _ignored_failure_reason(error_msg)
+                step_entries.append({**entry_common, "status": "skipped", "report_status": "SKIP",
+                                     "skip_reason": skip_reason,
+                                     "log": f"↷ 步骤失败(已忽略): {error_msg}"})
+                await emit(
+                    {
+                        "type": "step_update",
+                        "step_id": str(index),
+                        "step_index": index,
+                        "status": "skipped",
+                        "log": f"↷ 步骤 {index + 1} 跳过(失败已忽略): {error_msg}",
+                        "duration": round(duration, 2),
+                        "timestamp": _now_iso(),
+                        "screenshot": screenshot_base64,
+                        "error": error_msg,
+                        "error_code": error_code,
+                        "suggestion": error_suggestion,
+                        "skip_reason": skip_reason,
+                    }
+                )
+                continue
+
+            if status == "WARNING":
                 step_entries.append({**entry_common, "status": "warning", "report_status": "WARNING",
-                                     "log": f"⚠ 步骤失败(IGNORE): {error_msg}"})
+                                     "log": f"⚠ 步骤告警: {error_msg}"})
                 await emit(
                     {
                         "type": "step_update",
                         "step_id": str(index),
                         "step_index": index,
                         "status": "warning",
-                        "log": f"⚠ 步骤 {index + 1} 失败(已忽略): {error_msg}",
+                        "log": f"⚠ 步骤 {index + 1} 告警: {error_msg}",
                         "duration": round(duration, 2),
                         "timestamp": _now_iso(),
                         "screenshot": screenshot_base64,
@@ -521,6 +604,13 @@ async def execute_prepared_steps(
                 await _blocking(runner.disconnect)
             except Exception:
                 logger.exception("Runner 断开失败")
+
+    # 中止/失败中断后补齐剩余步骤的结果记录（不触发 before_step / before_device_step）：
+    # 结果条数恒等于步骤条数，报告不再把截断伪装成「总共就这么多步」。
+    if len(step_entries) < len(prepared_steps):
+        padding_reason = SKIP_REASON_USER_ABORTED if aborted else SKIP_REASON_UPSTREAM_ABORTED
+        for index in range(len(step_entries), len(prepared_steps)):
+            step_entries.append(_padded_skip_entry(prepared_steps[index], index, padding_reason))
 
     if isinstance(getattr(runner, "runtime_variables", None), dict):
         runtime_variables.update(

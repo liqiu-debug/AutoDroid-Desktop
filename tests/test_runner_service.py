@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any, Dict, List
 
 import pytest
@@ -227,25 +228,42 @@ def test_run_case_local_failure_abort_reports_fail(fake_runner):
     assert "元素未找到" in (finish_payload["error"] or "")
 
 
-def test_run_case_local_ignore_strategy_warns_not_fails(fake_runner):
+def test_run_case_local_ignore_failure_is_skip_and_case_passes(fake_runner):
+    """IGNORE 失败 → 步骤 SKIP + skip_reason=失败已忽略：<原文>，用例结论 PASS。
+
+    口径变更（EXECUTION_SPEC 2.2）：IGNORE 不再记 WARNING（旧断言：statuses==["WARNING","PASS"]
+    且 case/finish status==WARNING），只保留 error 等留痕，不参与结论判定。
+    """
     FakeBridgeSteps = [
         {"order": 1, "action": "click", "args": {"selector": "#x"}, "error_strategy": "IGNORE",
          "execute_on": ["android"]},
         {"order": 2, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
     ]
     FakeRunner.results["click"] = {"status": "FAIL", "duration": 0.1, "attempts": 1,
-                                   "error": "找不到", "step": {"action": "click"}}
+                                   "error": "找不到", "error_code": "E2001_ELEMENT_NOT_FOUND",
+                                   "suggestion": "检查定位器", "step": {"action": "click"}}
     bridge = FakeBridge(steps=FakeBridgeSteps)
     result, messages, _ = _run(bridge=bridge)
 
     assert result["success"] is True  # IGNORE 失败不计入 failed
     _, steps_payload = bridge.step_payloads[0]
     statuses = [s["status"] for s in steps_payload["steps"]]
-    assert statuses == ["WARNING", "PASS"]
-    # S2：IGNORE-only 聚合 WARNING——finish 显式透传（不得压成 PASS/FAIL）
-    assert result["status"] == "WARNING"
+    assert statuses == ["SKIP", "PASS"]
+    ignored = steps_payload["steps"][0]
+    # 原始失败留痕保留（error 不改写），仅状态与结论口径变化
+    assert ignored["error"] == "找不到"
+    assert ignored["error_code"] == "E2001_ELEMENT_NOT_FOUND"
+    # skip_reason 走 output.skip_reason 透传（上报协议不改 schema）
+    assert ignored["output"]["skip_reason"] == "失败已忽略：找不到"
+    # 结论只由未被容忍的失败决定：混合（SKIP + PASS）判 PASS
+    assert result["status"] == "PASS"
     _, finish_payload = bridge.finished[0]
-    assert finish_payload["status"] == "WARNING"
+    assert finish_payload["status"] == "PASS"
+
+    # WS 步骤行同步为 skipped，且带 skip_reason（细节留痕仍在 error/suggestion 上）
+    skipped_updates = [m for m in messages if m.get("status") == "skipped"]
+    assert skipped_updates and skipped_updates[0]["error"] == "找不到"
+    assert skipped_updates[0]["skip_reason"] == "失败已忽略：找不到"
 
 
 def test_run_case_local_all_skipped_finishes_warning(fake_runner):
@@ -263,6 +281,23 @@ def test_run_case_local_all_skipped_finishes_warning(fake_runner):
     assert finish_payload["status"] == "WARNING"
     complete = messages[-1]
     assert complete["type"] == "run_complete" and complete["status"] == "WARNING"
+
+
+def test_run_case_local_all_ignored_finishes_warning_by_all_skipped_rule(fake_runner):
+    """全 SKIP 例外：所有步骤都是被 IGNORE 的失败 → 用例仍归 WARNING（没真正验证到东西）。"""
+    FakeRunner.results["click"] = {"status": "FAIL", "duration": 0.1, "attempts": 1,
+                                   "error": "找不到", "step": {"action": "click"}}
+    bridge = FakeBridge(
+        steps=[
+            {"order": 1, "action": "click", "args": {"selector": "#a"}, "error_strategy": "IGNORE",
+             "execute_on": ["android"]},
+        ]
+    )
+    result, messages, _ = _run(bridge=bridge)
+    assert result["status"] == "WARNING"
+    _, finish_payload = bridge.finished[0]
+    assert finish_payload["status"] == "WARNING"
+    assert messages[-1]["status"] == "WARNING"
 
 
 def test_run_case_local_unexpected_exception_reports_error(fake_runner):
@@ -297,6 +332,90 @@ def test_run_case_local_skips_platform_mismatch(fake_runner):
     assert skip_updates
     _, steps_payload = bridge.step_payloads[0]
     assert [s["status"] for s in steps_payload["steps"]] == ["SKIP", "PASS"]
+    # 平台跳过（P1001）沿用现状，补记 skip_reason=平台不匹配
+    assert steps_payload["steps"][0]["output"]["skip_reason"] == "平台不匹配"
+
+
+def test_run_case_local_abort_failure_pads_remaining_steps(fake_runner):
+    """ABORT 失败中断后补齐剩余步骤：结果条数恒等于步骤条数（报告缺步修复）。"""
+    FakeBridgeSteps = [
+        {"order": 1, "action": "click", "args": {"selector": "#x"}, "error_strategy": "ABORT",
+         "execute_on": ["android"]},
+        {"order": 2, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
+        {"order": 3, "action": "home", "args": {}, "error_strategy": "CONTINUE", "execute_on": ["android"]},
+    ]
+    FakeRunner.results["click"] = {"status": "FAIL", "duration": 0.1, "attempts": 1,
+                                   "error": "元素未找到", "step": {"action": "click"}}
+    bridge = FakeBridge(steps=FakeBridgeSteps)
+    result, _, _ = _run(bridge=bridge)
+
+    assert result["success"] is False
+    _, steps_payload = bridge.step_payloads[0]
+    steps = steps_payload["steps"]
+    assert len(steps) == 3, "结果条数必须等于步骤条数"
+    assert [s["status"] for s in steps] == ["FAIL", "SKIP", "SKIP"]
+    assert [s["order"] for s in steps] == [1, 2, 3]
+    for padded in steps[1:]:
+        assert padded["error"] is None
+        assert padded["duration"] == 0
+        assert padded["screenshot_base64"] is None
+        assert padded["output"]["skip_reason"] == "上游步骤失败，中止执行"
+    # 用例结论仍由未被容忍的失败决定
+    assert result["status"] == "FAIL"
+
+
+def test_run_case_local_user_abort_pads_remaining_steps(fake_runner, monkeypatch):
+    """用户中止 break 后补齐剩余步骤：skip_reason=用户中止执行。"""
+    abort_event = threading.Event()
+    calls = {"n": 0}
+
+    class AbortAfterFirst(FakeRunner):
+        def run_step(self, step):
+            calls["n"] += 1
+            result = super().run_step(step)
+            if calls["n"] == 1:
+                abort_event.set()  # 模拟执行第一步期间用户点了终止
+            return result
+
+    monkeypatch.setattr(runner_service, "CrossPlatformRunner", AbortAfterFirst)
+    bridge = FakeBridge(
+        steps=[
+            {"order": 1, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
+            {"order": 2, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
+            {"order": 3, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
+        ]
+    )
+    result, _, _ = _run(bridge=bridge, abort_event=abort_event)
+
+    _, steps_payload = bridge.step_payloads[0]
+    steps = steps_payload["steps"]
+    assert len(steps) == 3, "结果条数必须等于步骤条数"
+    assert steps[0]["status"] == "WARNING"  # 被中止的那一步沿用现状（执行已被用户终止）
+    assert [s["status"] for s in steps[1:]] == ["SKIP", "SKIP"]
+    for padded in steps[1:]:
+        assert padded["error"] is None
+        assert padded["duration"] == 0
+        assert padded["output"]["skip_reason"] == "用户中止执行"
+    assert result["status"] == "ABORTED"
+
+
+def test_padding_records_do_not_execute_their_steps(fake_runner):
+    """补齐记录的步骤并未执行：不进 run_step（自然也不触发 before_step / before_device_step）。"""
+    abort_event = threading.Event()
+    abort_event.set()  # 进入循环即中止：全部步骤都靠补齐记录
+    bridge = FakeBridge(
+        steps=[
+            {"order": 1, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
+            {"order": 2, "action": "home", "args": {}, "error_strategy": "ABORT", "execute_on": ["android"]},
+        ]
+    )
+    result, _, _ = _run(bridge=bridge, abort_event=abort_event)
+
+    assert FakeRunner.instances[0].run_steps == [], "补齐记录不得真正执行步骤"
+    _, steps_payload = bridge.step_payloads[0]
+    assert [s["status"] for s in steps_payload["steps"]] == ["SKIP", "SKIP"]
+    assert all(s["output"]["skip_reason"] == "用户中止执行" for s in steps_payload["steps"])
+    assert result["status"] == "ABORTED"
 
 
 def test_run_case_local_continues_when_cloud_report_fails(fake_runner):

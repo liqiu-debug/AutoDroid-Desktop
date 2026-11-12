@@ -313,7 +313,11 @@ def test_scenario_all_skipped_finishes_with_warning_status(fake_runner):
 
 
 def test_scenario_ignore_only_finishes_with_warning_status(fake_runner):
-    """S2：IGNORE-only（步骤失败但 error_strategy=IGNORE）聚合 WARNING。"""
+    """全 SKIP 例外：两个用例的步骤全是被 IGNORE 的失败 → 用例归 skipped、场景聚合 WARNING。
+
+    口径变更（EXECUTION_SPEC 2.2）：IGNORE 失败已记 SKIP，不再计入告警；这里的 WARNING
+    来自既有 all_skipped 口径（本次没真正验证到东西），不是 IGNORE 降级。
+    """
     bridge = FakeScenarioBridge(
         case_steps={
             11: [
@@ -332,6 +336,79 @@ def test_scenario_ignore_only_finishes_with_warning_status(fake_runner):
     assert result["status"] == "WARNING"
     _, finish_payload = bridge.finished[0]
     assert finish_payload["status"] == "WARNING"
+    # 步骤行记 SKIP + skip_reason（不再 WARNING）
+    first_steps = bridge.step_payloads[0][1]["steps"]
+    assert [s["status"] for s in first_steps] == ["SKIP"]
+    assert first_steps[0]["output"]["skip_reason"] == "失败已忽略：找不到"
+    # WS 场景日志仍按「失败已忽略」告警展示（靠 skip_reason 与平台不匹配区分）
+    ignored_logs = [m for m in messages if "失败已忽略" in str(m.get("message") or "")]
+    assert ignored_logs and ignored_logs[0]["level"] == "warning"
+
+
+def test_scenario_ignore_failure_does_not_downgrade_conclusion(fake_runner):
+    """IGNORE 不拉低场景结论：忽略的失败 + 其余步骤/用例通过 → 场景 PASS。"""
+    bridge = FakeScenarioBridge(
+        case_steps={
+            11: [
+                {"order": 1, "action": "click", "args": {},
+                 "platform_overrides": {"android": {"selector": "#a", "by": "id"}},
+                 "execute_on": ["android"], "timeout": 10, "error_strategy": "IGNORE",
+                 "description": "点A", "retry_count": 0},
+                {"order": 2, "action": "home", "args": {}, "execute_on": ["android"],
+                 "timeout": 10, "error_strategy": "ABORT", "description": "回桌面", "retry_count": 0},
+            ],
+            22: [{"order": 1, "action": "home", "args": {}, "execute_on": ["android"],
+                  "timeout": 10, "error_strategy": "ABORT", "description": "回桌面", "retry_count": 0}],
+        },
+        scenario_steps=[
+            {"id": 1, "scenario_id": 7, "case_id": 11, "order": 1, "alias": "登录-A"},
+            {"id": 2, "scenario_id": 7, "case_id": 22, "order": 2, "alias": "收尾"},
+        ],
+    )
+    FakeRunner.results["click"] = {"status": "FAIL", "error": "找不到", "duration": 0.1}
+    result, messages, bridge = _run_scenario(bridge=bridge)
+
+    assert result["status"] == "PASS"
+    assert result["success"] is True
+    # 两个用例都执行（IGNORE 不中断）
+    assert len(bridge.step_payloads) == 2
+    assert result["case_statuses"] == ["success", "success"]
+    assert [s["status"] for s in bridge.step_payloads[0][1]["steps"]] == ["SKIP", "PASS"]
+    _, finish_payload = bridge.finished[0]
+    assert finish_payload["status"] == "PASS"
+
+
+def test_scenario_abort_failure_pads_remaining_step_records(fake_runner):
+    """场景链路复用同一执行核心：ABORT 中断后补齐记录，结果条数恒等于步骤条数。"""
+    FakeRunner.results["click"] = {"status": "FAIL", "error": "点不到", "duration": 0.1}
+    bridge = FakeScenarioBridge(
+        case_steps={
+            11: [
+                {"order": 1, "action": "click", "args": {},
+                 "platform_overrides": {"android": {"selector": "#a", "by": "id"}},
+                 "execute_on": ["android"], "timeout": 10, "error_strategy": "ABORT",
+                 "description": "点A", "retry_count": 0},
+                {"order": 2, "action": "home", "args": {}, "execute_on": ["android"],
+                 "timeout": 10, "error_strategy": "ABORT", "description": "回桌面", "retry_count": 0},
+                {"order": 3, "action": "home", "args": {}, "execute_on": ["android"],
+                 "timeout": 10, "error_strategy": "ABORT", "description": "再回桌面", "retry_count": 0},
+            ],
+            22: [{"order": 1, "action": "home", "args": {}, "execute_on": ["android"],
+                  "timeout": 10, "error_strategy": "ABORT", "description": "回桌面", "retry_count": 0}],
+        },
+    )
+    result, messages, bridge = _run_scenario(bridge=bridge)
+
+    first_steps = bridge.step_payloads[0][1]["steps"]
+    assert len(first_steps) == 3
+    assert [s["status"] for s in first_steps] == ["FAIL", "SKIP", "SKIP"]
+    assert [s["output"]["skip_reason"] for s in first_steps[1:]] == [
+        "上游步骤失败，中止执行",
+        "上游步骤失败，中止执行",
+    ]
+    # ABORT → 不再跑后续用例
+    assert len(bridge.step_payloads) == 1
+    assert result["status"] == "FAIL"
 
 
 def test_scenario_unexpected_exception_finishes_with_error(fake_runner):

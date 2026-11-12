@@ -251,6 +251,66 @@ def test_steps_payload_parses_and_name_is_contract_field():
     assert parsed.steps[0].status == "PASS"
 
 
+def test_skip_reason_travels_inside_output_without_schema_change():
+    """上报协议不改 schema：skip_reason 走 output.skip_reason 透传（ClientRunStep 无该列）。"""
+    bridge = _CaptureBridge()
+    ctx = _context(bridge)
+    ctx.create_cloud_run("登录用例", "android")
+    ctx.report_step_results(
+        "登录用例",
+        True,
+        [
+            {
+                "order": 1,
+                "action": "click",
+                "report_status": "SKIP",
+                "duration": 0.1,
+                "attempts": 1,
+                "error": "找不到",
+                "error_code": "E2001_ELEMENT_NOT_FOUND",
+                "screenshot_base64": None,
+                "output": None,
+                "skip_reason": "失败已忽略：找不到",
+            },
+            {
+                "order": 2,
+                "action": "home",
+                "report_status": "SKIP",
+                "duration": 0,
+                "attempts": 1,
+                "error": None,
+                "error_code": None,
+                "screenshot_base64": None,
+                "output": None,
+                "skip_reason": "上游步骤失败，中止执行",
+            },
+            {
+                "order": 3,
+                "action": "home",
+                "report_status": "PASS",
+                "duration": 0.2,
+                "attempts": 1,
+                "error": None,
+                "error_code": None,
+                "screenshot_base64": None,
+                "output": {"echo": "home"},
+            },
+        ],
+        {},
+    )
+
+    payload = bridge.step_payloads[0]
+    parsed = ClientRunStepsPayload.model_validate(payload)
+    # 协议模型没有 skip_reason 列（与平台 schema 保持一致）
+    assert "skip_reason" not in ClientRunStep.model_fields
+    assert [step.output["skip_reason"] for step in parsed.steps[:2]] == [
+        "失败已忽略：找不到",
+        "上游步骤失败，中止执行",
+    ]
+    # 纯增量：没有 skip_reason 的步骤不注入空键，output 原样透传
+    assert parsed.steps[2].output == {"echo": "home"}
+
+
 def test_empty_steps_batch_requires_explicit_success():
     """R6：空步骤批次不得被 all([])==True 推导为 PASS——success 必须显式。"""
     bridge = _CaptureBridge()
