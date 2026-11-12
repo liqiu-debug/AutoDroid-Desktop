@@ -35,6 +35,7 @@ from engine.core.execution_service import (
 )
 from engine.core.run_registry import LocalRunRecord
 from engine.core.runner_service import (
+    SKIP_REASON_IGNORED_FAILURE,
     LocalRunContext,
     build_precheck_payload,
     execute_prepared_steps,
@@ -82,9 +83,14 @@ def scenario_step_log_emit(emit: Emit) -> Emit:
         if status == "success":
             await emit_log(emit, "success", f"    ✓ 成功: {text}")
         elif status == "skipped":
-            await emit_log(emit, "info", f"    ↷ 跳过: {text}")
+            # IGNORE 容忍的失败：步骤行状态是 SKIP，但仍按「失败已忽略」告警展示
+            # （靠 skip_reason 与平台不匹配/中止补齐的跳过区分）。
+            if str(message.get("skip_reason") or "").startswith(SKIP_REASON_IGNORED_FAILURE):
+                await emit_log(emit, "warning", f"    🟡 失败已忽略: {message.get('error') or text}")
+            else:
+                await emit_log(emit, "info", f"    ↷ 跳过: {text}")
         elif status == "warning":
-            await emit_log(emit, "warning", f"    🟡 忽略错误: {message.get('error') or text}")
+            await emit_log(emit, "warning", f"    🟡 告警: {message.get('error') or text}")
         elif status == "failed":
             await emit_log(emit, "error", f"    ❌ 失败: {message.get('error') or text}")
         else:
@@ -269,6 +275,11 @@ def precheck_scenario_for_device(
 # --------------------------------------------------------------------------- #
 
 def _case_ui_status(step_entries: List[Dict[str, Any]], success: bool) -> str:
+    """用例 UI 状态：结论只由未被容忍的失败决定。
+
+    IGNORE 失败已记 SKIP（skip_reason=失败已忽略：…），既不算失败也不算告警；
+    全 SKIP（含全部被 IGNORE）归类 skipped——本次没真正验证到东西。
+    """
     if any(entry.get("report_status") == "FAIL" for entry in step_entries):
         return "failed"
     if step_entries and all(entry.get("report_status") == "SKIP" for entry in step_entries):
@@ -303,7 +314,11 @@ def _summary_message(total_duration: float, case_statuses: List[str], aborted: b
 
 
 def _overall_status(case_statuses: List[str], aborted: bool) -> str:
-    """对齐 scenario_results._summarize_cases_results 聚合口径。"""
+    """对齐 scenario_results._summarize_cases_results 聚合口径。
+
+    IGNORE 不中断场景、不拉低场景结论（用例已归 skipped/PASS）；全 skipped 归 WARNING，
+    表示本次没有真正验证到任何内容。
+    """
     if aborted:
         return "ABORTED"
     if any(status == "failed" for status in case_statuses):
