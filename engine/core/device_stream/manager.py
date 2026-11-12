@@ -153,6 +153,14 @@ def _video_stall_timeout() -> float:
     return VIDEO_STALL_TIMEOUT_SEC
 
 
+class DeviceNotReadyError(ValueError):
+    """设备流尚未就绪（并发起跑时可预期的竞态，不是故障）。
+
+    继承 ValueError 保持旧调用方 `except ValueError` 语义不变，调用方可用类型精确区分
+    「等一等就好」与「真的出错了」。
+    """
+
+
 class DeviceInfo:
     """已连接设备的运行时状态"""
 
@@ -1280,7 +1288,7 @@ class ScrcpyDeviceManager:
     ) -> RollingScrcpyRecorderSession:
         dev_info = self._devices.get(serial)
         if not dev_info or not dev_info.ready:
-            raise ValueError(f"设备 {serial} 未就绪")
+            raise DeviceNotReadyError(f"设备 {serial} 未就绪")
 
         if dev_info.recorder:
             try:
@@ -1343,6 +1351,28 @@ class ScrcpyDeviceManager:
         ).start()
 
     # ==================== 查询接口 ====================
+
+    def is_ready(self, serial: str) -> bool:
+        """设备流是否已就绪（只读：不建连、不重连、不改状态）。
+
+        录制这类「必须等就绪才能启动」的调用方用它做有界等待，而不是撞上未就绪就降级。
+        """
+        dev_info = self._devices.get(serial)
+        return bool(dev_info and dev_info.ready)
+
+    def wait_until_ready(self, serial: str, timeout: float = 8.0, interval: float = 0.2) -> bool:
+        """有界轮询等待设备流就绪，到点仍未就绪返回 False（不抛异常、不改状态）。
+
+        两个任务可能同一时刻起跑（实测 80ms 内先后进入），后到的设备流几百毫秒后才 ready。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if self.is_ready(serial):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(max(0.0, float(interval)), remaining))
 
     def get_devices_list(self) -> list:
         """返回所有已管理设备的状态信息"""

@@ -51,6 +51,10 @@ MONITOR_SHUTDOWN_TIMEOUT_SECONDS = 12
 LOCAL_REPLAY_PRE_ROLL_SEC = 30
 LOCAL_REPLAY_POST_ROLL_SEC = 5
 LOCAL_REPLAY_SEGMENT_SEC = 5
+# 启动录制前等设备流就绪的有界预算：两个任务可能同一时刻起跑（实测 80ms 内先后进入），
+# 后到的设备流几百毫秒后才 ready，等一小段再降级，避免把「晚到」记成「能力缺失」
+LOCAL_REPLAY_READY_WAIT_SEC = 8.0
+LOCAL_REPLAY_READY_POLL_SEC = 0.2
 # 本机回放产物目录：userData/fastbot_reports/<task_id>/replays/
 LOCAL_REPORTS_DIR_NAME = "fastbot_reports"
 LOCAL_REPORTS_RETAIN_DAYS = 7
@@ -149,6 +153,55 @@ def publish_local_replays(bridge: CloudBridge, task_id: int, report: Dict[str, A
         replay["path"] = f"reports/fastbot/{int(task_id)}/replays/{path.name}"
 
 
+def _device_not_ready_type() -> Optional[type]:
+    """DeviceNotReadyError 的类型；取不到就 None。
+
+    这里必须自己吞掉 import 异常：本函数是在「启动录制失败」的 except 分支里被调用的，
+    而那次失败本身就可能是这个 import 挂了（adbutils 缺失/损坏等）。若再炸一次，
+    异常会逃出 run_fastbot_local，整轮稳定性测试陪葬 —— 降级继续跑才是原语义。
+    """
+    try:
+        from engine.core.device_stream.manager import DeviceNotReadyError
+    except Exception:
+        return None
+    return DeviceNotReadyError
+
+
+def _local_replay_failure_status(exc: BaseException) -> str:
+    """启动录制失败归类：设备流没就绪是并发起跑的可预期竞态（not_ready），其余是 error。
+
+    调用点在 except 分支里，本函数自身不能再抛，所以归类逻辑整体再兜一层。
+    """
+    try:
+        not_ready = _device_not_ready_type()
+        if not_ready is not None and isinstance(exc, not_ready):
+            return "not_ready"
+        if isinstance(exc, ValueError) and "未就绪" in str(exc):
+            return "not_ready"  # 兼容 manager 旧 ValueError 契约（测试替身/历史调用方）
+    except Exception:
+        return "error"
+    return "error"
+
+
+async def _wait_device_stream_ready(device_manager: Any, serial: str) -> bool:
+    """有界等待设备流就绪；到点未就绪返回 False（不抛，避免把主流程一起拖垮）。
+
+    走 to_thread 轮询：monkey / logcat 协程同时在跑，不能阻塞事件循环。
+    """
+    try:
+        return bool(
+            await asyncio.to_thread(
+                device_manager.wait_until_ready,
+                serial,
+                LOCAL_REPLAY_READY_WAIT_SEC,
+                LOCAL_REPLAY_READY_POLL_SEC,
+            )
+        )
+    except Exception as exc:  # 只读查询失败按未就绪处理
+        logger.warning("查询设备流就绪状态失败，按未就绪处理: %s", exc)
+        return False
+
+
 async def run_fastbot_local(
     *,
     device_serial: str,
@@ -172,7 +225,8 @@ async def run_fastbot_local(
     返回 client-fastbot report 六列：performance_data / jank_data / jank_events /
     trace_artifacts / crash_events / summary。
     enable_local_replay：本机滚动录制 scrcpy 码流，Crash/ANR 时截取回放；
-    录制不可用（设备流未就绪/未给产物目录）时按降级处理并在 summary 标注。
+    录制不可用（设备流未就绪/未给产物目录）时按降级处理并在 summary 标注，
+    精确原因记在 summary.local_replay_status / local_replay_error。
     """
     duration = max(1, int(duration or 0))
     throttle = max(0, int(throttle or 0))
@@ -201,24 +255,43 @@ async def run_fastbot_local(
 
     replay_started = False
     replay_dir = str(report_dir or "")
+    # 精确状态：on / disabled / not_ready / error（summary.local_replay_status）。
+    # 注意 local_replay_enabled 与 summary.degraded 的语义与格式一个字都不能动：
+    # 前端按这两个字段渲染「未开启（客户端降级）」。
+    replay_status = "disabled"
+    replay_error: Optional[str] = None
     if enable_local_replay:
         if not replay_dir:
+            # run_and_report 恒传 local_report_dir(task_id)，这里只兜外部直调
+            replay_status = "error"
+            replay_error = "未提供回放产物目录"
             logger.warning("未提供回放产物目录，本次不录制异常回放")
         else:
             try:
                 from engine.core.device_stream.manager import device_manager
 
                 os.makedirs(replay_dir, exist_ok=True)
-                device_manager.start_recording(
-                    device_serial,
-                    int(task_id or 0),
-                    replay_dir,
-                    LOCAL_REPLAY_PRE_ROLL_SEC,
-                    LOCAL_REPLAY_POST_ROLL_SEC,
-                    LOCAL_REPLAY_SEGMENT_SEC,
-                )
-                replay_started = True
+                # 设备流常常晚几百毫秒才 ready（两任务同毫秒起跑），等一小段再降级
+                if not await _wait_device_stream_ready(device_manager, device_serial):
+                    replay_status = "not_ready"
+                    replay_error = (
+                        f"设备流 {LOCAL_REPLAY_READY_WAIT_SEC:g}s 内未就绪: {device_serial}"
+                    )
+                    logger.warning("启动异常回放录制失败，本次报告无崩溃回放: %s", replay_error)
+                else:
+                    device_manager.start_recording(
+                        device_serial,
+                        int(task_id or 0),
+                        replay_dir,
+                        LOCAL_REPLAY_PRE_ROLL_SEC,
+                        LOCAL_REPLAY_POST_ROLL_SEC,
+                        LOCAL_REPLAY_SEGMENT_SEC,
+                    )
+                    replay_started = True
+                    replay_status = "on"
             except Exception as exc:
+                replay_status = _local_replay_failure_status(exc)
+                replay_error = f"{type(exc).__name__}: {exc}"
                 logger.warning("启动异常回放录制失败，本次报告无崩溃回放: %s", exc)
 
     async def _capture_local_replay(event_type: str, event_time: str) -> Optional[Dict[str, Any]]:
@@ -321,6 +394,9 @@ async def run_fastbot_local(
         enable_jank_frame_monitor=False,
     )
     summary["local_replay_enabled"] = bool(replay_started)
+    summary["local_replay_status"] = replay_status
+    if replay_error:  # 健康时不留噪音字段
+        summary["local_replay_error"] = replay_error
     degraded = ["jank_frame_monitor"]
     if enable_local_replay and not replay_started:
         degraded.append("local_replay")
@@ -468,13 +544,14 @@ def run_and_report(
         except Exception as exc:
             logger.warning("client-fastbot 收尾上报失败（结果仅本地日志可见）: %s", exc)
         logger.info(
-            "Fastbot 本地执行收尾: task=%s status=%s duration=%.1fs crashes=%s anrs=%s replay=%s",
+            "Fastbot 本地执行收尾: task=%s status=%s duration=%.1fs crashes=%s anrs=%s replay=%s replay_status=%s",
             task_id,
             status,
             time.time() - started,
             summary.get("total_crashes"),
             summary.get("total_anrs"),
             summary.get("local_replay_enabled"),
+            summary.get("local_replay_status"),
         )
 
     threading.Thread(
