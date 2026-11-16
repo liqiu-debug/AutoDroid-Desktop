@@ -495,7 +495,7 @@ async def run_scenario_local(
                 )
                 for step_index, step_item in enumerate(prepared_steps):
                     prepared_steps[step_index] = await _blocking(
-                        recording_service.localize_step_images, step_item, bridge.ensure_template_local
+                        recording_service.localize_step_images, step_item, bridge.ensure_template_local, platform
                     )
             except Exception as exc:
                 await emit_log(emit, "error", f"    ❌ 异常: {exc}")

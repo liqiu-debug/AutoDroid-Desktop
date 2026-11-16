@@ -124,7 +124,7 @@ def fake_runner(monkeypatch):
     FakeRunner.export_vars = {}
     monkeypatch.setattr(runner_service, "CrossPlatformRunner", FakeRunner)
     monkeypatch.setattr(
-        runner_service.recording_service, "localize_step_images", lambda step, ensure: step
+        runner_service.recording_service, "localize_step_images", lambda step, ensure, platform: step
     )
     return FakeRunner
 
@@ -701,7 +701,7 @@ def test_scenario_ws_run_registers_and_can_be_cancelled(client, monkeypatch, moc
 
     monkeypatch.setattr(runner_service, "CrossPlatformRunner", SlowRunner)
     monkeypatch.setattr(
-        runner_service.recording_service, "localize_step_images", lambda step, ensure: step
+        runner_service.recording_service, "localize_step_images", lambda step, ensure, platform: step
     )
     monkeypatch.setattr(
         cloud_bridge.CloudBridge,

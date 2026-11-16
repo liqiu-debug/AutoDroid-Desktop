@@ -246,7 +246,7 @@ def test_background_run_registers_and_cancel_aborts_it(client, monkeypatch):
 
     monkeypatch.setattr(runner_service, "CrossPlatformRunner", SlowRunner)
     monkeypatch.setattr(
-        runner_service.recording_service, "localize_step_images", lambda step, ensure: step
+        runner_service.recording_service, "localize_step_images", lambda step, ensure, platform: step
     )
 
     resp = client.post("/api/cases/5/run?device_serial=USB1")

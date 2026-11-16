@@ -108,7 +108,7 @@ def fake_runner(monkeypatch):
     FakeRunner.results = {}
     FakeRunner.instances = []
     monkeypatch.setattr(runner_service, "CrossPlatformRunner", FakeRunner)
-    monkeypatch.setattr(runner_service.recording_service, "localize_step_images", lambda step, ensure: step)
+    monkeypatch.setattr(runner_service.recording_service, "localize_step_images", lambda step, ensure, platform: step)
     return FakeRunner
 
 

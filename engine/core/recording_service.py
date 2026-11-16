@@ -26,7 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from engine.core import ios_device
 from engine.core.device_transport_metrics import device_transport_metrics
-from engine.core.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner
+from engine.core.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner, _resolve_image_path
+from engine.core.locator_resolution import resolve_locator_candidates
 from engine.core.execution_service import resolve_device_platform
 from engine.core.step_contract import (
     legacy_step_to_standard,
@@ -688,29 +689,38 @@ def _unwrap_runner_dump_device(driver, platform: str):
     return driver
 
 
-def localize_step_images(step: Dict[str, Any], ensure_local) -> Dict[str, Any]:
+def localize_step_images(step: Dict[str, Any], ensure_local, platform: str = "android") -> Dict[str, Any]:
     """把步骤里的模板 image_path 归一为本地绝对路径（ensure_local: str -> str）。
 
     图像步骤的 image_path 形如 static/images/element_x.png（云端引用格式）；
     本地 Runner 需要真实文件：先查 userData/templates 缓存，缺失回源云端。
     """
     step_item = dict(step or {})
+    if step_item.get("action") not in {"click_image", "assert_image"}:
+        return step_item
+    if step_item.get("execute_on") and platform not in normalize_execute_on(step_item["execute_on"]):
+        return step_item
     args = dict(step_item.get("args") or {})
-    changed = False
-    for key in ("image_path", "path"):
-        value = args.get(key)
-        if not value:
-            continue
-        text = str(value)
-        # 仅处理非绝对路径（云端引用）；已本地化/纯 URL 不动
-        if not text.startswith("/") and not re.match(r"^[A-Za-z]:[\\/]", text):
-            try:
-                args[key] = ensure_local(text)
-                changed = True
-            except Exception as exc:
-                logger.warning("模板本地化失败 %s: %s", text, exc)
-    if changed or args:
-        step_item["args"] = args
+    # Use the runner's precedence: the active platform image overrides args.
+    # Localizing only args leaves that override pointing into the frozen app.
+    target = _resolve_image_path(step_item, args, resolve_locator_candidates(step_item, platform=platform),
+                                 platform, step_item.get("value"))
+    if not target:
+        return step_item
+    text = str(target).strip()
+    if text.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", text):
+        return step_item
+    try:
+        local_path = ensure_local(text)
+    except Exception as exc:
+        raise RecordingError(f"图像模板下载或缓存读取失败，请重新截取或重试：{text}", status_code=502) from exc
+    args["image_path"] = local_path
+    step_item["args"] = args
+    overrides = dict(step_item.get("platform_overrides") or {})
+    current = overrides.get(platform)
+    if isinstance(current, dict) and str(current.get("by") or "").lower() == "image":
+        overrides[platform] = {**current, "selector": local_path}
+        step_item["platform_overrides"] = overrides
     return step_item
 
 
@@ -748,7 +758,7 @@ def execute_single_step(
             default_platform=platform,
         )
         if ensure_local is not None:
-            standard_step = localize_step_images(standard_step, ensure_local)
+            standard_step = localize_step_images(standard_step, ensure_local, platform)
         runner = CrossPlatformRunner(
             platform=platform,
             device_id=device_serial,

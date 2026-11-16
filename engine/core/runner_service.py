@@ -703,7 +703,7 @@ async def run_case_local(
             )
             for index, step_item in enumerate(prepared_steps):
                 prepared_steps[index] = await _blocking(
-                    recording_service.localize_step_images, step_item, bridge.ensure_template_local
+                    recording_service.localize_step_images, step_item, bridge.ensure_template_local, platform
                 )
         except Exception as exc:
             await emit({"type": "error", "message": f"步骤准备失败: {exc}"})

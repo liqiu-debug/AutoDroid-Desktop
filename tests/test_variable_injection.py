@@ -146,7 +146,7 @@ def test_run_case_local_injects_env_and_case_variables(monkeypatch):
 
     monkeypatch.setattr(runner_service, "CrossPlatformRunner", CaptureRunner)
     monkeypatch.setattr(
-        runner_service.recording_service, "localize_step_images", lambda step, ensure: step
+        runner_service.recording_service, "localize_step_images", lambda step, ensure, platform: step
     )
 
     bridge = _VarBridge()

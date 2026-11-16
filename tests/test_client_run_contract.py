@@ -410,7 +410,7 @@ def fake_runner_module(monkeypatch):
     FakeRunner.instances = []
     monkeypatch.setattr(runner_service, "CrossPlatformRunner", FakeRunner)
     monkeypatch.setattr(
-        runner_service.recording_service, "localize_step_images", lambda step, ensure: step
+        runner_service.recording_service, "localize_step_images", lambda step, ensure, platform: step
     )
 
     bridge = FakeBridge()

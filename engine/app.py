@@ -284,8 +284,10 @@ def create_app() -> FastAPI:
 
     @app.get("/api/client/info")
     async def client_info() -> JSONResponse:
+        from engine.core.utils.image_match import matcher_capabilities
         return JSONResponse(
-            content={"clientMode": True, "platform": platform_name(), "version": client_version()}
+            content={"clientMode": True, "platform": platform_name(), "version": client_version(),
+                     "image_matcher": matcher_capabilities()}
         )
 
     @app.post("/api/auth/token")

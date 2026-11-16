@@ -43,6 +43,7 @@ from pydantic import BaseModel, Field
 from engine.core import recording_service
 from engine.core.cloud_bridge import CloudBridge, auth_headers_from_request, template_cache_dir
 from engine.core.recording_service import RecordingError
+from engine.core.utils.image_match_preview import crop_metadata, preview_image_match
 
 logger = logging.getLogger(__name__)
 
@@ -360,7 +361,34 @@ async def crop_template(request: Request, payload: CropTemplatePayload) -> JSONR
         logger.warning("模板本地缓存写入失败", exc_info=True)
 
     logger.info("手动截取模板图已保存: %s (%s bytes)", image_path, len(image_bytes))
-    return JSONResponse(content={"image_path": image_path})
+    metadata = await _to_thread(crop_metadata, image_bytes, payload.screenshot_base64)
+    return JSONResponse(content={"image_path": image_path, **metadata})
+
+
+class MatchImagePayload(BaseModel):
+    screenshot_base64: str
+    image_path: str
+    image_options: Optional[Dict[str, Any]] = None
+
+
+@router.post("/api/device/match_image")
+@router.post("/device/match_image", include_in_schema=False)
+async def preview_match_image(request: Request, payload: MatchImagePayload) -> JSONResponse:
+    """Match a provided frame locally. This endpoint never connects to a device."""
+    import re
+
+    if not re.fullmatch(r"static/images/[\w.-]+\.(?:png|jpe?g)", payload.image_path, flags=re.IGNORECASE):
+        return JSONResponse(status_code=400, content={"detail": "模板路径无效，请重新截取"})
+    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
+    try:
+        path = await _to_thread(bridge.ensure_template_local, payload.image_path)
+        from pathlib import Path
+        result = await _to_thread(preview_image_match, payload.screenshot_base64, Path(path).read_bytes(), payload.image_options)
+        return JSONResponse(content=result)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"detail": f"模板读取失败: {exc}"})
 
 
 # --------------------------------------------------------------------------- #
