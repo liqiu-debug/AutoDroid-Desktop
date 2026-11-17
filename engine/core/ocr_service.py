@@ -1,4 +1,4 @@
-# 来源：AutoDroid backend/ocr_service.py（vendor）。剥离点：仅改写导入 backend.utils.ocr_compat → engine.core.utils.ocr_compat。
+# 来源：AutoDroid backend/ocr_service.py（vendor）。桌面端使用随包分发的离线 OCR 引擎。
 """
 OCR 引擎全局单例服务
 
@@ -11,6 +11,7 @@ OCR 引擎全局单例服务
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from typing import Any, Optional
@@ -37,7 +38,7 @@ class OCRService:
             lang: 语言类型
 
         Returns:
-            PaddleOCR 引擎实例
+            内置 OCR 引擎实例
 
         Raises:
             RuntimeError: OCR 引擎初始化失败
@@ -50,8 +51,8 @@ class OCRService:
                     logger.info("初始化 OCR 引擎（use_angle_cls=%s, lang=%s）...", use_angle_cls, lang)
 
                     try:
-                        from engine.core.utils.ocr_compat import create_paddle_ocr_engine
-                        cls._engine = create_paddle_ocr_engine(
+                        from engine.core.utils.desktop_ocr import create_ocr_engine
+                        cls._engine = create_ocr_engine(
                             use_angle_cls=use_angle_cls,
                             lang=lang
                         )
@@ -62,9 +63,12 @@ class OCRService:
                         )
                     except Exception as exc:
                         logger.error("OCR 引擎初始化失败: %s", exc, exc_info=True)
-                        raise RuntimeError(
-                            "OCR 引擎初始化失败，请确保已安装 paddleocr 及其依赖"
-                        ) from exc
+                        hint = (
+                            "请重新安装包含 OCR 组件的完整客户端"
+                            if getattr(sys, "frozen", False)
+                            else "请在客户端引擎 Python 环境执行 pip install -r requirements.txt"
+                        )
+                        raise RuntimeError(f"OCR 引擎初始化失败：{exc}；{hint}") from exc
 
         return cls._engine
 

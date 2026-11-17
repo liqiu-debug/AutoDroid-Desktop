@@ -228,6 +228,7 @@ npm run test:smoke      # 真起引擎进程做端到端：client/info → 登�
 
 - 引擎用 PyInstaller **onedir** 打包（`engine.spec`，冷启动 1–2 秒；onefile 实测 28 秒已弃用），产物 `release-engine/autodroid-engine/`。
 - PyInstaller **不能跨平台**：Windows 引擎必须在 Windows 上构建，macOS 引擎在 macOS 上构建。
+- OCR 使用 RapidOCR 2.1.0 + ONNX Runtime 1.20.1（macOS 需 13.3+），随引擎打包中英文 PP-OCR 模型、字典及动态库，运行时无需安装 Python/PaddleOCR 或下载模型。更新依赖后先执行 `pip install -r requirements.txt`，再重新构建引擎。构建脚本在封装安装包前执行 `autodroid-engine --check-ocr`，通过实际文字识别检查内置组件是否可用；开发态可用 `python -m engine --check-ocr`。
 - 三类前置产物缺一不可，`scripts/check-dist-prereqs.sh` 在 `npm run dist*` 之前硬校验，缺件直接失败（electron-builder 对缺失的 `extraResources` 只告警不报错，否则会打出没有引擎 / 没有 UI / 没有 adb 的"死包"）：
   1. 前端 `../AutoDroid/frontend/dist/index.html`
   2. 引擎 `release-engine/autodroid-engine[.exe]`
@@ -266,6 +267,7 @@ powershell -ExecutionPolicy Bypass -File .\build-windows.ps1
 |---|---|
 | 启动卡在加载页，随后提示"引擎启动超时（30s 内未输出 AUTODROID_ENGINE_PORT）" | 引擎没起来。开发态终端看 `[engine]` 前缀的 stderr；常见是 `pip install -r requirements.txt` 没装全，或 `AUTODROID_PYTHON` 指错解释器 |
 | "引擎进程提前退出（code=…）" | 同上；打包态表示内置引擎自身崩溃，用 `AUTODROID_ENGINE_LOG_LEVEL=DEBUG` 从终端启动应用看完整输出 |
+| OCR 步骤提示未安装 paddleocr | 旧版桌面引擎未包含 OCR 依赖。安装包含离线 OCR 的新版完整客户端；给系统 Python 安装 paddleocr 不会修复客户端内置引擎。开发态请安装本仓库 requirements.txt 并重建引擎 |
 | 窗口白屏 / 404 | 前端 dist 缺失：先构建 `AutoDroid/frontend`，或用 `AUTODROID_FRONTEND_DIST` 指向正确目录 |
 | 设备中心看不到手机 | 引擎找不到 adb：`bash scripts/fetch-platform-tools.sh <平台>` 内置一份，或确认 `adb devices` 在终端可用并已授权 USB 调试 |
 | 登录成功但"设备同步失败 / 上报失败" | 平台版本不含 `client-*` 路由，升级平台到 `main` |

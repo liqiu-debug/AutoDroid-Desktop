@@ -71,6 +71,8 @@ if (Test-Path 'build-engine') { Remove-Item -Recurse -Force 'build-engine' }
 .\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --distpath release-engine --workpath build-engine engine.spec
 $engineExe = 'release-engine\autodroid-engine\autodroid-engine.exe'
 if (-not (Test-Path $engineExe)) { Fail "引擎产物缺失: $engineExe" }
+& $engineExe --check-ocr
+if ($LASTEXITCODE -ne 0) { Fail "内置 OCR 自检失败，请检查依赖和模型后重新构建引擎" }
 Ok "引擎就绪: $engineExe"
 
 # ---------- 2. 前端 dist（AutoDroid/frontend，缺省由脚本自动构建） ----------

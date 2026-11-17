@@ -121,15 +121,7 @@ class IOSDriver(
 
     @classmethod
     def _ensure_ocr_prewarm_started(cls) -> None:
-        """启动 OCR 预热（使用全局服务）。
-
-        桌面端剥离点：引擎不打包 paddleocr（体积大），未安装时不预热——否则每次连接 iOS 设备
-        都会打一段 ERROR 堆栈；真正用到 OCR 的步骤仍会报出可读错误。
-        """
-        import importlib.util
-
-        if importlib.util.find_spec("paddleocr") is None:
-            return
+        """预热随客户端分发的离线 OCR 引擎（使用全局服务）。"""
         start_ocr_prewarm(use_angle_cls=False, lang="ch")
 
     @classmethod

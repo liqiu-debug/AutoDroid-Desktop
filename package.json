@@ -1,7 +1,7 @@
 {
   "name": "autodroid-desktop",
   "productName": "AutoDroid",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "AutoDroid 桌面客户端（Electron 壳 + 本地引擎网关）",
   "main": "main.js",
   "license": "MIT",
@@ -129,6 +129,7 @@
         }
       ],
       "category": "public.app-category.developer-tools",
+      "minimumSystemVersion": "13.3",
       "icon": "assets/icon.icns"
     }
   }

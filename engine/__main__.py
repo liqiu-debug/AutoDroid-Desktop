@@ -45,6 +45,18 @@ def _setup_file_logging() -> logging.Handler | None:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--check-ocr"]:
+        import json
+
+        from engine.core.utils.desktop_ocr import check_ocr
+
+        try:
+            print(json.dumps(check_ocr(), ensure_ascii=False), flush=True)
+            return 0
+        except Exception as exc:
+            print(f"OCR 自检失败: {exc}", file=sys.stderr)
+            return 1
+
     from engine.app import app
 
     try:

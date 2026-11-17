@@ -10,6 +10,9 @@ Pillow>=12.1
 uiautomator2>=3.5
 numpy>=1.26
 opencv-python>=4.10
+# 离线 OCR：固定包含中英文 PP-OCR 模型的版本；ORT 同时提供 macOS arm64/x64 和 Windows wheels。
+rapidocr==2.1.0
+onnxruntime==1.20.1
 # iOS 录制 / 用例执行（engine/core/drivers/ios_*、engine/core/ios_device.py）：有线 iPhone 走 WDA
 facebook-wda>=1.5,<2
 findit

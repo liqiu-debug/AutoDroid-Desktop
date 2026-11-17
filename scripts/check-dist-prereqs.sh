@@ -44,6 +44,11 @@ check_engine() {
   fi
   if [ -f "${REPO_ROOT}/release-engine/autodroid-engine/${exe_name}" ] ||
     [ -f "${REPO_ROOT}/release-engine/${exe_name}" ]; then
+    local engine_path="${REPO_ROOT}/release-engine/autodroid-engine/${exe_name}"
+    if [ ! -f "${engine_path}" ]; then
+      engine_path="${REPO_ROOT}/release-engine/${exe_name}"
+    fi
+    "${engine_path}" --check-ocr || fail "内置 OCR 自检失败，请安装 requirements.txt 并重新构建引擎"
     return 0
   fi
   if [ "${platform}" = "windows" ]; then
