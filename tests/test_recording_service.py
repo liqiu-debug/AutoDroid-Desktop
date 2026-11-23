@@ -3,11 +3,22 @@ from __future__ import annotations
 
 import base64
 import io
+from unittest.mock import Mock
+from pathlib import Path
 
 import pytest
 
 from engine.core import recording_service
 from engine.core.recording_service import RecordingError
+
+
+@pytest.fixture(autouse=True)
+def isolate_fake_template_analysis(monkeypatch):
+    # Path localization uses intentionally fake caches in this module.
+    original_read = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: original_read(self) if self.exists() else b"fake-template")
+    monkeypatch.setattr("engine.core.utils.adaptive_template.ensure_descriptor",
+                        lambda raw, config=None, **kwargs: config or {"profile": "adaptive-v2"})
 
 
 def _png_base64(width: int = 40, height: int = 30) -> str:
@@ -42,6 +53,31 @@ def test_crop_template_clamps_out_of_bounds():
     # 越界坐标被钳制到图像内（同上游语义）
     image_bytes, _ = recording_service.crop_template_image(_png_base64(10, 10), -5, -5, 100, 100)
     assert image_bytes[:2] == b"\x89P"
+
+
+def test_recording_screenshot_preserves_pil_pixels_in_png():
+    from PIL import Image
+
+    source = Image.new("RGBA", (32, 64), (255, 255, 255, 255))
+    for x in range(32):
+        source.putpixel((x, x + 16), (x * 7, x * 3, x * 5, 255))
+    screenshot, image_format = recording_service._take_screenshot_payload(
+        Mock(screenshot=Mock(return_value=source))
+    )
+    recorded = Image.open(io.BytesIO(base64.b64decode(screenshot)))
+    assert image_format == "png"
+    assert recorded.format == "PNG"
+    assert recorded.size == source.size
+    assert recorded.tobytes() == source.convert("RGB").tobytes()
+
+
+def test_ios_recording_preserves_native_png_bytes():
+    raw = base64.b64decode(_png_base64())
+    screenshot, image_format = recording_service._take_screenshot_payload(
+        Mock(screenshot=Mock(return_value=raw)), platform="ios"
+    )
+    assert image_format == "png"
+    assert base64.b64decode(screenshot) == raw
 
 
 def test_localize_step_images_rewrites_relative_template_paths():
@@ -86,6 +122,16 @@ class _FakeDevice:
         self.hierarchy_calls += 1
         return _FAKE_HIERARCHY_XML
 
+    @property
+    def adb_device(self):
+        from types import SimpleNamespace
+        def shell(command, encoding=None, timeout=None):
+            assert command == ["screencap", "-p"]
+            buffer = io.BytesIO()
+            self.screenshot().save(buffer, format="PNG")
+            return buffer.getvalue()
+        return SimpleNamespace(shell=shell)
+
     def screenshot(self):
         from PIL import Image
 
@@ -129,7 +175,7 @@ def test_dump_device_payload_shape(fake_device):
     assert payload["hierarchy_xml"].startswith("<hierarchy")
     assert payload["hierarchy_hash"]
     assert payload["screenshot"]
-    assert payload["screenshot_format"] == "jpeg"
+    assert payload["screenshot_format"] == "png"
     assert payload["device_info"]["displayWidth"] == 1080
 
 

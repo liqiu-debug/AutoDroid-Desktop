@@ -51,6 +51,17 @@ def _task(**overrides) -> Dict[str, Any]:
     return task
 
 
+@pytest.fixture(autouse=True)
+def _mock_execution_data(monkeypatch):
+    monkeypatch.setattr(
+        cloud_bridge.CloudBridge, "fetch_scenario_execution_data",
+        lambda self, scenario_id, env_id=None: {
+            "schema_version": 1, "scenario": {"id": scenario_id, "name": "巡检"},
+            "scenario_steps": [], "cases": {}, "env_variables": {}, "app_key_mapping": {},
+        },
+    )
+
+
 @pytest.fixture()
 def mock_cloud():
     from test_local_api import _MockCloud
@@ -67,7 +78,7 @@ def mock_cloud():
 def client(tmp_path, monkeypatch, mock_cloud):
     from fastapi.testclient import TestClient
 
-    from engine.app import create_app
+    from safe_lifespan import create_test_app as create_app
 
     monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
     monkeypatch.delenv("AUTODROID_FRONTEND_DIST", raising=False)
@@ -200,7 +211,7 @@ def test_execute_task_precheck_filters_and_runs_with_task_name(monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": serial != "BAD", "cases": []},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": serial != "BAD", "cases": []},
     )
     monkeypatch.setattr(
         scenario_service, "start_background_scenario_run", lambda **kwargs: started.append(kwargs)
@@ -239,7 +250,7 @@ def test_execute_task_skips_devices_not_on_this_machine(monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": True, "cases": []},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": True, "cases": []},
     )
     monkeypatch.setattr(
         scenario_service, "start_background_scenario_run", lambda **kwargs: started.append(kwargs)
@@ -259,7 +270,7 @@ def test_execute_task_fail_open_when_local_list_unknown(monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": True, "cases": []},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": True, "cases": []},
     )
     monkeypatch.setattr(
         scenario_service, "start_background_scenario_run", lambda **kwargs: started.append(kwargs)
@@ -277,7 +288,7 @@ def test_execute_task_ios_serial_not_filtered_by_adb_list(monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": True, "cases": []},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": True, "cases": []},
     )
     monkeypatch.setattr(
         scenario_service, "start_background_scenario_run", lambda **kwargs: started.append(kwargs)

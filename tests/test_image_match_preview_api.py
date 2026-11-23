@@ -1,6 +1,7 @@
 """Local HTTP integration: real image preview, fake cloud storage, no devices."""
 import base64
 import hashlib
+import io
 from unittest.mock import Mock
 
 import cv2
@@ -8,9 +9,11 @@ import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from engine import local_api
 from engine.core import recording_service
+from engine.core.utils.image_click import locate_stable_image
 
 
 def png_bytes(image):
@@ -45,7 +48,16 @@ def preview_client(tmp_path, monkeypatch):
         downloads = []
 
         def __init__(self, **kwargs):
-            pass
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.close()
+
+        def close(self):
+            self.closed = True
 
         def upload_template(self, raw, filename):
             self.uploads.append((raw, filename))
@@ -155,6 +167,39 @@ def test_jpeg_recording_frame_retains_pixel_geometry_and_legacy_route_alias(prev
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "matched"
     assert response.json()["point"] == [34, 70]
+
+
+def test_lossless_recording_crop_preview_and_execution_use_same_arrow_pixels(preview_client):
+    client, _, storage = preview_client
+    screen = np.full((160, 220, 3), 255, np.uint8)
+    cv2.polylines(screen, [np.array([[54, 49], [46, 58], [54, 67]])], False,
+                  (55, 55, 55), 1, cv2.LINE_AA)
+    source = Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB))
+    screenshot, image_format = recording_service._take_screenshot_payload(
+        Mock(screenshot=Mock(return_value=source))
+    )
+    assert image_format == "png"
+    recorded = Image.open(io.BytesIO(base64.b64decode(screenshot)))
+    assert recorded.tobytes() == source.tobytes()
+    response = client.post("/api/device/crop_template", json={
+        "screenshot_base64": screenshot, "x1": 30, "y1": 40, "x2": 70, "y2": 80,
+    })
+    assert response.status_code == 200, response.text
+    metadata = response.json()
+    path = storage / metadata["image_path"].rsplit("/", 1)[-1]
+    assert Image.open(path).tobytes() == source.crop((30, 40, 70, 80)).tobytes()
+    # Preview and execution read independently encoded device PNG frames.
+    execution_frame = png_bytes(screen)
+    response = client.post("/api/device/match_image", json={
+        "screenshot_base64": base64.b64encode(execution_frame).decode("ascii"),
+        "image_path": metadata["image_path"], "image_options": config(metadata),
+    })
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["status"] == "matched"
+    execution = locate_stable_image(lambda: execution_frame, path, config(metadata), timeout=2)
+    assert execution["point"] == result["point"]
+    assert execution["stable_frames"] == 2
 
 
 def test_local_preview_exposes_ambiguous_candidates_and_honors_explicit_region(preview_client):

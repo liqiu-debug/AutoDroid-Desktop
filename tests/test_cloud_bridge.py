@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import threading
 import time
+import asyncio
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
@@ -241,3 +243,141 @@ def test_upload_client_fastbot_artifact_sends_multipart_path_and_bytes(tmp_path)
         assert replay_bytes in body
     finally:
         server.stop()
+
+
+def test_task_client_reuses_real_http_connection_and_closes():
+    import http.server
+
+    peers = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):  # noqa: N802
+            peers.append(self.client_address)
+            self.send_response(200)
+            self.send_header("content-length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with CloudBridge(upstream=f"http://127.0.0.1:{server.server_port}") as bridge:
+            assert bridge.get_json("/first") == {}
+            assert bridge.get_json("/second") == {}
+            client = bridge._http
+            assert client is not None and not client.is_closed
+        assert peers[0] == peers[1]
+        assert client.is_closed
+        bridge.close()
+        with pytest.raises(RuntimeError, match="已关闭"):
+            bridge.get_json("/third")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_data_create_upload_timeouts_and_auth_are_per_request(monkeypatch):
+    from engine.core import cloud_bridge
+
+    requests = []
+    original_client = httpx.Client
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json={"id": 42, "ok": True})
+
+    monkeypatch.setattr(cloud_bridge.httpx, "Client", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handle), **kwargs
+    ))
+    with CloudBridge(upstream="https://first.example", auth_headers={"Authorization": "Bearer first"}) as bridge:
+        bridge.get_json("/data")
+        bridge.create_run({"run_id": "fixed-run"})
+        bridge.post_multipart("/template", {"file": ("image.png", b"png", "image/png")})
+        bridge.report_steps(42, {"steps": []})
+        bridge.finish_run(42, {"status": "PASS"})
+    assert requests[0].extensions["timeout"] == {"connect": 3.0, "read": 15.0, "write": 5.0, "pool": 2.0}
+    assert requests[1].extensions["timeout"] == {"connect": 3.0, "read": 5.0, "write": 5.0, "pool": 2.0}
+    assert all(request.extensions["timeout"]["read"] == 120.0 for request in requests[2:])
+    assert all(request.headers["authorization"] == "Bearer first" for request in requests)
+
+
+def test_async_creation_uses_given_client_and_short_timeout():
+    seen = []
+
+    async def handle(request):
+        seen.append(request)
+        return httpx.Response(200, json={"id": 42})
+
+    async def run():
+        with CloudBridge(upstream="https://first.example", auth_headers={"Authorization": "Bearer first"}) as bridge:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                assert await bridge.create_run_async({"run_id": "fixed-run"}, client) == {"id": 42}
+                assert bridge._http is None
+
+    asyncio.run(run())
+    assert seen[0].url == "https://first.example/api/client-runs/"
+    assert seen[0].extensions["timeout"] == {"connect": 3.0, "read": 5.0, "write": 5.0, "pool": 2.0}
+    assert seen[0].headers["authorization"] == "Bearer first"
+
+
+def test_close_during_cancelled_to_thread_finishes_and_releases_connection(monkeypatch):
+    from engine.core import cloud_bridge
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_client = httpx.Client
+
+    def handle(request):
+        entered.set()
+        assert release.wait(timeout=5)
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(cloud_bridge.httpx, "Client", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handle), **kwargs
+    ))
+    bridge = CloudBridge(upstream="https://first.example")
+
+    async def run():
+        task = asyncio.create_task(asyncio.to_thread(bridge.get_json, "/slow"))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        client = bridge._http
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        bridge.close()
+        assert bridge._closed and not client.is_closed
+        release.set()
+        await asyncio.to_thread(lambda: None)
+        return client
+
+    client = asyncio.run(run())
+    assert client.is_closed
+    assert bridge._http is None
+
+
+@pytest.mark.parametrize("kind", ["case", "scenario"])
+def test_execution_data_version_error_never_falls_back_to_old_endpoints(kind, monkeypatch):
+    from engine.core import cloud_bridge
+
+    paths = []
+    original_client = httpx.Client
+
+    def handle(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"schema_version": 0})
+
+    monkeypatch.setattr(cloud_bridge.httpx, "Client", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handle), **kwargs
+    ))
+    with CloudBridge(upstream="https://first.example") as bridge:
+        with pytest.raises(ValueError, match="版本不兼容"):
+            getattr(bridge, f"fetch_{kind}_execution_data")(5)
+    assert paths == [f"/api/{kind}s/5/execution-data"]

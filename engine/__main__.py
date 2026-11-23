@@ -45,6 +45,24 @@ def _setup_file_logging() -> logging.Handler | None:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--check-image-match"]:
+        import json
+        import traceback
+
+        if len(sys.argv) != 3:
+            print("用法: autodroid-engine --check-image-match <fixtures_dir>", file=sys.stderr)
+            return 2
+        try:
+            from engine.core.utils.adaptive_selfcheck import check_image_match
+
+            print(json.dumps(check_image_match(sys.argv[2]), ensure_ascii=False), flush=True)
+            return 0
+        except Exception as exc:
+            print(json.dumps({"ok": False, "offline": True, "error": str(exc),
+                              "error_type": type(exc).__name__, "error_context": getattr(exc, "context", None)},
+                             ensure_ascii=False), flush=True)
+            traceback.print_exc(file=sys.stderr)
+            return 1
     if sys.argv[1:] == ["--check-ocr"]:
         import json
 

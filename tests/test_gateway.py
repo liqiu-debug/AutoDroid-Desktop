@@ -191,7 +191,7 @@ def test_client_info(client):
     assert data["clientMode"] is True
     assert data["version"] == "9.9.9-test"
     assert data["platform"] in ("darwin", "win32", "linux")
-    assert data["image_matcher"] == {"version": "strict-v1", "validated": True, "preview": True, "metadata": True}
+    assert data["image_matcher"] == {"version": "strict-v1", "validated": True, "preview": True, "metadata": True, "profiles": ["strict-v1", "adaptive-v2"], "descriptor_versions": [1]}
 
 
 def test_auth_token_rejects_invalid_server(client):

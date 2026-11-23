@@ -5,11 +5,22 @@ from unittest.mock import patch, Mock
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def isolate_descriptor_analysis_in_contract_tests(monkeypatch):
+    # These contracts exercise metadata/path selection, not image decoding.
+    monkeypatch.setattr("engine.core.utils.adaptive_template.ensure_descriptor",
+                        lambda raw, config=None, **kwargs: config or {"profile": "adaptive-v2"})
+    original_read = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: original_read(self) if self.exists() else b"cached")
+
 from engine.core.drivers.cross_platform_runner import DriverFactory, TestCaseRunner as CaseRunner
 from engine.core.execution_errors import ExecutionStepRuntimeError
 from engine.core.step_contract import legacy_step_to_standard, standard_step_to_legacy
 from engine.core import recording_service
 from engine.core.cloud_bridge import CloudBridge
+from engine.core.execution_service import prepare_steps_for_platform
+from engine.core.utils.image_match_options import preserve_image_references
 
 
 CONFIG = {"template_sha256": "a" * 64, "tap_anchor": [0.1, 0.9], "source_size": [1080, 2400]}
@@ -21,13 +32,13 @@ class ImageDriver:
         self.error = None
         self.assertion_calls = []
 
-    def click_image(self, path, image_options=None, timeout=10):
+    def click_image(self, path, image_options=None, timeout=10, image_match=None):
         self.calls.append((path, image_options, timeout))
         if self.error:
             raise self.error
         return {"image_match": {"status": "matched", "point": [10, 20]}}
 
-    def assert_image(self, path, match_mode="exists", image_options=None, timeout=10, abort_event=None):
+    def assert_image(self, path, match_mode="exists", image_options=None, timeout=10, abort_event=None, image_match=None):
         self.assertion_calls.append((path, image_options, match_mode))
         return {"image_match": {"status": "matched" if match_mode == "exists" else "not_found"}}
 
@@ -35,9 +46,9 @@ class ImageDriver:
         pass
 
 
-def runner(driver):
+def runner(driver, platform="android"):
     with patch("engine.core.drivers.cross_platform_runner.is_driver_pool_enabled", return_value=False), patch.object(DriverFactory, "create", return_value=driver):
-        return CaseRunner(platform="android", device_id="offline")
+        return CaseRunner(platform=platform, device_id="offline", wda_url="http://offline.invalid")
 
 
 def test_metadata_round_trip_and_selected_platform_path():
@@ -58,6 +69,107 @@ def test_invalid_inactive_metadata_is_not_ignored():
     result = runner(driver).run_step({"action": "click_image", "args": {"image_path": "global.png", "image_options": {"android": CONFIG, "ios": None}}})
     assert result["error_code"] == "P1006_INVALID_ARGS"
     assert driver.calls == []
+
+
+@pytest.mark.parametrize("platform,other", [("android", "ios"), ("ios", "android")])
+@pytest.mark.parametrize("action", ["click_image", "assert_image"])
+def test_single_platform_recording_borrows_template_binding_without_screen_geometry(platform, other, action):
+    original = {**CONFIG, "search_region": [0, 0, 0.5, 0.5]}
+    step = {"action": action, "args": {"image_path": "recorded.png", "image_options": {other: original}},
+            "platform_overrides": {other: {"by": "image", "selector": "recorded.png"}}}
+    driver = ImageDriver()
+    result = runner(driver, platform).run_step(step)
+    assert result["status"] == "PASS", result
+    calls = driver.calls if action == "click_image" else driver.assertion_calls
+    assert calls[0][:2] == ("recorded.png", {"template_sha256": CONFIG["template_sha256"], "tap_anchor": CONFIG["tap_anchor"]})
+    assert step["args"]["image_options"][other] == original
+
+
+def test_recropped_ios_preserves_unbound_legacy_android_template():
+    step = {"action": "click_image", "args": {"image_path": "android-old.png", "image_options": {"ios": CONFIG}},
+            "platform_overrides": {"android": {"by": "image", "selector": "android-old.png"},
+                                   "ios": {"by": "image", "selector": "ios-new.png"}}}
+    driver = ImageDriver()
+    result = runner(driver).run_step(step)
+    assert result["status"] == "PASS", result
+    assert driver.calls[0][:2] == ("android-old.png", {})
+
+
+@pytest.mark.parametrize("platform,other", [("android", "ios"), ("ios", "android")])
+def test_localized_single_platform_template_keeps_its_fingerprint_and_anchor(tmp_path, platform, other):
+    cached = tmp_path / "cached.png"
+    cached.write_bytes(b"cached")
+    step = {"action": "click_image", "args": {"image_path": "static/images/recorded.png", "image_options": {other: CONFIG}},
+            "platform_overrides": {other: {"selector": "static/images/recorded.png", "by": "image"}}}
+    original = copy.deepcopy(step)
+    localized = recording_service.localize_step_images(step, lambda _: str(cached), platform)
+    assert localized["platform_overrides"][other]["selector"] == str(cached)
+    driver = ImageDriver()
+    assert runner(driver, platform).run_step(localized)["status"] == "PASS"
+    assert driver.calls[0][:2] == (str(cached), {"template_sha256": CONFIG["template_sha256"], "tap_anchor": CONFIG["tap_anchor"]})
+    assert step == original
+
+
+def test_localization_keeps_an_independent_other_platform_template(tmp_path):
+    step = {"action": "click_image", "args": {"image_path": "android.png", "image_options": {"ios": CONFIG}},
+            "platform_overrides": {"android": {"by": "image", "selector": "android.png"},
+                                   "ios": {"by": "image", "selector": "ios.png"}}}
+    localized = recording_service.localize_step_images(step, lambda _: str(tmp_path / "android.png"), "android")
+    assert localized["platform_overrides"]["ios"]["selector"] == "ios.png"
+    driver = ImageDriver()
+    assert runner(driver).run_step(localized)["status"] == "PASS"
+    assert driver.calls[0][1] == {}
+
+
+@pytest.mark.parametrize("platform,donor", [("android", "ios"), ("ios", "android")])
+@pytest.mark.parametrize("action", ["click_image", "assert_image"])
+@pytest.mark.parametrize("key", ["image_path", "path"])
+def test_preparation_and_localization_preserve_an_implicit_donor_template(tmp_path, platform, donor, action, key):
+    step = {"action": action, "args": {key: "donor-old.png", "image_options": {donor: CONFIG}},
+            "platform_overrides": {platform: {"by": "image", "selector": "independent.png"}}}
+    original = copy.deepcopy(step)
+    prepared = prepare_steps_for_platform([step], platform)[0]
+    assert prepared["platform_overrides"][donor] == {"by": "image", "selector": "donor-old.png"}
+    cached = str(tmp_path / "independent.png")
+    # Both direct single-step localization and the prepare-then-localize batch
+    # path must retain the donor's original identity.
+    for source in (step, prepared):
+        localized = recording_service.localize_step_images(source, lambda _: cached, platform)
+        assert localized["platform_overrides"][donor]["selector"] == "donor-old.png"
+        driver = ImageDriver()
+        result = runner(driver, platform).run_step(localized)
+        assert result["status"] == "PASS", result
+        calls = driver.calls if action == "click_image" else driver.assertion_calls
+        assert calls[0][:2] == (cached, {})
+    assert step == original
+
+
+def test_reference_preservation_does_not_replace_an_existing_nonimage_override():
+    step = {"action": "click_image", "args": {"path": "legacy.png", "image_options": {"ios": CONFIG}},
+            "platform_overrides": {"ios": {"by": "text", "selector": "existing-label"}}}
+    original = copy.deepcopy(step)
+    result = preserve_image_references(step, step["args"])
+    assert result["platform_overrides"]["ios"] == original["platform_overrides"]["ios"]
+    assert step == original
+
+
+@pytest.mark.parametrize("platform,donor", [("android", "ios"), ("ios", "android")])
+@pytest.mark.parametrize("action", ["click_image", "assert_image"])
+@pytest.mark.parametrize("reference", ["path", "selector"])
+def test_runtime_variables_preserve_a_borrowed_noncenter_anchor(platform, donor, action, reference):
+    step = {"action": action, "args": {"image_options": {donor: CONFIG}}}
+    if reference == "path":
+        step["args"]["path"] = "{{IMAGE}}"
+        step["platform_overrides"] = {donor: {"by": "image", "selector": "{{IMAGE}}"}}
+    else:
+        step["selector"], step["selector_type"] = "{{IMAGE}}", "image"
+    driver = ImageDriver()
+    case_runner = runner(driver, platform)
+    case_runner.runtime_variables = {"IMAGE": "static/images/same.png"}
+    result = case_runner.run_step(step)
+    assert result["status"] == "PASS", result
+    calls = driver.calls if action == "click_image" else driver.assertion_calls
+    assert calls[0][:2] == ("static/images/same.png", {"template_sha256": CONFIG["template_sha256"], "tap_anchor": CONFIG["tap_anchor"]})
 
 
 def test_failed_tap_evidence_survives_without_retry():

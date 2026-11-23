@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -183,6 +184,9 @@ class LocalRunContext:
             # S1：云端 execution_id 回填本地登记（/api/runs/active 的 items[].execution_id
             # 供前端 terminate 载荷 {batch_id, execution_ids, device_serials} 命中）。
             run_registry.registry.update_execution_id(self.run_id, created_id)
+            record = run_registry.registry.get(self.run_id)
+            if record is not None:
+                record.metadata["cloud_record_pending"] = False
         except Exception as exc:
             logger.warning("client-runs 创建失败（本地继续执行，事后无法回看报告）: %s", exc)
             self.run_key = None
@@ -376,7 +380,7 @@ async def execute_prepared_steps(
     runtime_variables: Dict[str, str] = {}
     owns_runner = runner is None
 
-    if runner is None:
+    if runner is None and not (abort_event is not None and abort_event.is_set()):
         try:
             runner = await _blocking(
                 CrossPlatformRunner,
@@ -642,6 +646,7 @@ async def run_case_local(
     abort_event: Optional[threading.Event] = None,
     run_kind: str = "case",
     target_id: Optional[int] = None,
+    execution_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """本地执行用例（阻塞驱动调用走线程池），过程消息经 emit 推送，结果上报云端。
 
@@ -650,7 +655,7 @@ async def run_case_local(
     loop = asyncio.get_running_loop()
     run_id = run_id or str(uuid.uuid4())
     batch_id = batch_id or str(uuid.uuid4())
-    record = run_registry.registry.register(
+    record = run_registry.registry.get(run_id) or run_registry.registry.register(
         LocalRunRecord(
             kind=run_kind,
             target_id=int(target_id if target_id is not None else case_id),
@@ -680,11 +685,16 @@ async def run_case_local(
     try:
         case_name = f"case-{case_id}"
         try:
-            case = await _blocking(bridge.fetch_case, case_id)
+            data = deepcopy(execution_data) if execution_data is not None else await _blocking(
+                bridge.fetch_case_execution_data, case_id, env_id
+            )
+            if execution_data is None:
+                data = deepcopy(data)
+            case = data["case"]
             case_name = str((case or {}).get("name") or case_name)
-            step_rows = await _blocking(bridge.fetch_case_steps, case_id)
-            env_variables = await _blocking(bridge.fetch_env_variables, env_id)
-            mapping = await _blocking(bridge.fetch_app_key_mapping)
+            step_rows = data["standard_steps"]
+            env_variables = data["env_variables"]
+            mapping = data["app_key_mapping"]
         except Exception as exc:
             await emit({"type": "error", "message": f"拉取用例数据失败: {exc}"})
             return {"success": False, "error": str(exc)}
@@ -723,7 +733,7 @@ async def run_case_local(
             }
         )
 
-        context.create_cloud_run(case_name, platform)
+        await _blocking(context.create_cloud_run, case_name, platform)
         run_started_at = time.time()
 
         # S5：create_cloud_run 后执行体包 try/except——意外异常也必须收尾
@@ -916,16 +926,18 @@ def precheck_for_device(
     case_id: int,
     device_serial: str,
     env_id: Optional[int] = None,
+    execution_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """本地前置预检（响应形状对齐 backend/cross_platform_execution.precheck_case_execution）。
 
     - GET /api/cases/{id}/precheck 与 run-batch 的 blocked_prechecks 共用；
     - iOS 预检不因 WDA 探测失败而阻断（R4）：本地无 iOS 能力时仅告警（WARNING）。
     """
-    case = bridge.fetch_case(case_id)
-    step_rows = bridge.fetch_case_steps(case_id)
-    env_variables = bridge.fetch_env_variables(env_id)
-    mapping = bridge.fetch_app_key_mapping()
+    data = deepcopy(execution_data if execution_data is not None else bridge.fetch_case_execution_data(case_id, env_id))
+    case = data["case"]
+    step_rows = data["standard_steps"]
+    env_variables = data["env_variables"]
+    mapping = data["app_key_mapping"]
     variables_map = collect_case_variables_map((case or {}).get("variables"), env_variables)
     local = precheck_case_execution(
         step_rows,
@@ -948,8 +960,19 @@ def start_background_case_run(
     batch_id: str,
     auth_headers: Dict[str, str],
     notify: bool = False,
+    execution_data: Optional[Dict[str, Any]] = None,
+    upstream: Optional[str] = None,
 ) -> None:
     """POST /cases/{id}/run(-batch) 的后台执行：线程内驱动 + broker 广播。"""
+    from engine import config_store
+
+    task_upstream = upstream if upstream is not None else config_store.get_upstream() or ""
+    task_headers = dict(auth_headers)
+    task_data = deepcopy(execution_data)
+    record = run_registry.registry.register(LocalRunRecord(
+        kind="case", target_id=case_id, run_id=run_id, batch_id=batch_id, device_serial=device_serial,
+        metadata={"cloud_record_pending": True},
+    ))
 
     def _thread_main() -> None:
         async def _emit(message: Dict[str, Any]) -> None:
@@ -958,24 +981,32 @@ def start_background_case_run(
             broker.publish_sync(case_id, message)
 
         async def _run() -> None:
-            bridge = CloudBridge(auth_headers=auth_headers)
-            await run_case_local(
-                case_id=case_id,
-                env_id=env_id,
-                device_serial=device_serial,
-                run_id=run_id,
-                batch_id=batch_id,
-                emit=_emit,
-                bridge=bridge,
-                notify=notify,
-            )
+            with CloudBridge(upstream=task_upstream, auth_headers=task_headers) as bridge:
+                await run_case_local(
+                    case_id=case_id,
+                    env_id=env_id,
+                    device_serial=device_serial,
+                    run_id=run_id,
+                    batch_id=batch_id,
+                    emit=_emit,
+                    bridge=bridge,
+                    notify=notify,
+                    execution_data=task_data,
+                    abort_event=record.abort_event,
+                )
 
         try:
             asyncio.run(_run())
         except Exception:
             logger.exception("本地执行线程异常: case=%s device=%s", case_id, device_serial)
+        finally:
+            run_registry.registry.complete(run_id)
 
-    threading.Thread(target=_thread_main, name=f"local-run-{case_id}-{device_serial}", daemon=True).start()
+    try:
+        threading.Thread(target=_thread_main, name=f"local-run-{case_id}-{device_serial}", daemon=True).start()
+    except BaseException:
+        run_registry.registry.complete(run_id)
+        raise
 
 
 async def run_case_via_websocket(
@@ -984,30 +1015,54 @@ async def run_case_via_websocket(
     env_id: Optional[int],
     device_serial: Optional[str],
     auth_headers: Dict[str, str],
+    execution_data: Optional[Dict[str, Any]] = None,
+    upstream: Optional[str] = None,
 ) -> None:
     """WS /ws/run/{case_id}：连接即执行（语义对齐 ws_run.websocket_run_case）。"""
+    from engine import config_store
+
+    task_upstream = upstream if upstream is not None else config_store.get_upstream() or ""
+    task_headers = dict(auth_headers)
     await websocket.accept()
     broker.register(case_id, websocket)
 
     async def _emit(message: Dict[str, Any]) -> None:
         await broker.publish_async(case_id, message)
 
+    bridge: Optional[CloudBridge] = None
     try:
         if not device_serial:
             await _emit({"type": "error", "message": "请选择执行设备"})
             return
-        bridge = CloudBridge(auth_headers=auth_headers)
+        bridge = CloudBridge(upstream=task_upstream, auth_headers=task_headers)
+        data = deepcopy(execution_data) if execution_data is not None else await asyncio.to_thread(
+            bridge.fetch_case_execution_data, case_id, env_id
+        )
+        precheck = await asyncio.to_thread(
+            precheck_for_device, bridge, case_id, device_serial, env_id, execution_data=data
+        )
+        if not precheck.get("ok"):
+            from engine.core.scenario_service import summarize_precheck_failure
+
+            await _emit({
+                "type": "error", "message": f"运行前预检未通过: {summarize_precheck_failure(precheck)}",
+                "code": "C1001_CASE_PRECHECK_FAILED", "precheck": precheck,
+            })
+            return
         await run_case_local(
             case_id=case_id,
             env_id=env_id,
             device_serial=device_serial,
             emit=_emit,
             bridge=bridge,
+            execution_data=data,
         )
     except Exception as exc:
         logger.exception("WS 本地执行失败: case=%s", case_id)
         await _emit({"type": "error", "message": str(exc)})
     finally:
+        if bridge is not None:
+            bridge.close()
         broker.unregister(case_id, websocket)
         try:
             await websocket.close()

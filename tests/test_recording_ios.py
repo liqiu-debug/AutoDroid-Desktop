@@ -188,12 +188,15 @@ def test_bare_udid_resolves_to_ios_and_hint_wins():
 
 # --------------------------- 录制：dump / inspect / interact --------------------------- #
 
-def test_dump_ios_returns_same_size_jpeg_hierarchy_and_device_info(fake_wda):
+def test_dump_ios_preserves_native_png_hierarchy_and_device_info(fake_wda):
     from PIL import Image
 
     payload = recording_service.dump_device(serial=UDID)
-    assert payload["screenshot_format"] == "jpeg"
-    image = Image.open(io.BytesIO(base64.b64decode(payload["screenshot"])))
+    assert payload["screenshot_format"] == "png"
+    raw = base64.b64decode(payload["screenshot"])
+    assert raw == _png(), "WDA 原始 PNG 应直接用于录制，不再转码成 JPEG"
+    image = Image.open(io.BytesIO(raw))
+    assert image.format == "PNG"
     assert image.size == (1179, 2556), "截图像素不能变：点击坐标与模板裁剪都按截图像素计算"
     assert payload["hierarchy_xml"].startswith("<?xml")
     assert payload["device_info"]["platform"] == "ios"
@@ -304,7 +307,7 @@ def test_interact_ios_click_taps_pixels_and_returns_new_dump(fake_wda):
     assert result["step"]["selector"] == "7"
     driver = FakeIOSDriver.instances[0]
     assert ("tap", 175, 1414) in driver.calls, "IOSDriver.click_by_coordinates 收像素、内部除以 scale"
-    assert result["dump"]["hierarchy_xml"] and result["dump"]["screenshot_format"] == "jpeg"
+    assert result["dump"]["hierarchy_xml"] and result["dump"]["screenshot_format"] == "png"
     assert _lock_free()
 
 

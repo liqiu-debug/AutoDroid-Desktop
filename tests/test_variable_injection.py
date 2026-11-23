@@ -108,6 +108,13 @@ class _VarBridge:
     def fetch_app_key_mapping(self):
         return {}
 
+    def fetch_case_execution_data(self, case_id, env_id=None):
+        return {
+            "schema_version": 1, "case": self.fetch_case(case_id),
+            "standard_steps": self.fetch_case_steps(case_id),
+            "env_variables": self.fetch_env_variables(env_id), "app_key_mapping": {},
+        }
+
     def ensure_template_local(self, path):
         return path
 

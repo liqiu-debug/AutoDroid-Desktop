@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +34,8 @@ from engine import config_store
 logger = logging.getLogger(__name__)
 
 _UPLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
+DATA_TIMEOUT = httpx.Timeout(connect=3.0, read=15.0, write=5.0, pool=2.0)
+CREATE_RUN_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=2.0)
 
 
 def template_cache_dir() -> Path:
@@ -42,17 +46,40 @@ def template_cache_dir() -> Path:
 
 
 class CloudBridge:
-    """一次性调用的云端访问器（非线程安全；每次调用/任务各自构造）。"""
+    """请求/任务拥有的同步连接池；调用方通过 close 或 with 释放。
+
+    upstream 和鉴权在构造时取快照。同步 Client 可由任务的线程池调用，
+    不绑定 asyncio 循环；关闭必须发生在该任务的所有请求结束之后。
+    """
 
     def __init__(
         self,
         upstream: Optional[str] = None,
         auth_headers: Optional[Dict[str, str]] = None,
-        timeout: httpx.Timeout = _UPLOAD_TIMEOUT,
+        timeout: httpx.Timeout = DATA_TIMEOUT,
     ) -> None:
-        self.upstream = (upstream or config_store.get_upstream() or "").rstrip("/")
+        self.upstream = (upstream if upstream is not None else config_store.get_upstream() or "").rstrip("/")
         self.auth_headers = dict(auth_headers or {})
         self.timeout = timeout
+        self._http: Optional[httpx.Client] = None
+        self._client_lock = threading.Lock()
+        self._closed = False
+        self._inflight = 0
+
+    def __enter__(self) -> "CloudBridge":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        with self._client_lock:
+            self._closed = True
+            client = None
+            if not self._inflight:
+                client, self._http = self._http, None
+        if client is not None:
+            client.close()
 
     @property
     def available(self) -> bool:
@@ -67,32 +94,71 @@ class CloudBridge:
         base = self._require_upstream()
         return f"{base}{path if path.startswith('/') else '/' + path}"
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=self.timeout, follow_redirects=False)
+    @contextmanager
+    def _client(self):
+        with self._client_lock:
+            if self._closed:
+                raise RuntimeError("云端连接已关闭")
+            if self._http is None:
+                self._http = httpx.Client(timeout=self.timeout, follow_redirects=False)
+            client = self._http
+            self._inflight += 1
+        try:
+            yield client
+        finally:
+            to_close = None
+            with self._client_lock:
+                self._inflight -= 1
+                if self._closed and not self._inflight:
+                    to_close, self._http = self._http, None
+            if to_close is not None:
+                to_close.close()
 
     # ---------- 通用 ----------
 
     def get_json(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         with self._client() as client:
-            resp = client.get(self._url(path), params=params, headers=self.auth_headers)
-            resp.raise_for_status()
-            return resp.json()
+            resp = client.get(self._url(path), params=params, headers=self.auth_headers, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
 
-    def post_json(self, path: str, payload: Dict[str, Any]) -> Any:
+    def post_json(self, path: str, payload: Dict[str, Any], *, timeout: Optional[httpx.Timeout] = None) -> Any:
         with self._client() as client:
-            resp = client.post(self._url(path), json=payload, headers=self.auth_headers)
-            resp.raise_for_status()
-            if not resp.content:
-                return {}
-            return resp.json()
+            resp = client.post(
+                self._url(path), json=payload, headers=self.auth_headers, timeout=timeout or self.timeout
+            )
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
 
     def post_multipart(self, path: str, files: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> Any:
         with self._client() as client:
             resp = client.post(
-                self._url(path), files=files, data=data or {}, headers=self.auth_headers
+                self._url(path), files=files, data=data or {}, headers=self.auth_headers, timeout=_UPLOAD_TIMEOUT
             )
-            resp.raise_for_status()
-            return resp.json()
+        resp.raise_for_status()
+        return resp.json()
+
+    def fetch_case_execution_data(self, case_id: int, env_id: Optional[int] = None) -> Dict[str, Any]:
+        """一次取得原始执行输入；预检和运行共享该快照，不回退旧接口。"""
+        data = self.get_json(
+            f"/api/cases/{int(case_id)}/execution-data", params={"env_id": env_id} if env_id is not None else None
+        )
+        return self._execution_data(data, "case", "standard_steps")
+
+    def fetch_scenario_execution_data(self, scenario_id: int, env_id: Optional[int] = None) -> Dict[str, Any]:
+        data = self.get_json(
+            f"/api/scenarios/{int(scenario_id)}/execution-data",
+            params={"env_id": env_id} if env_id is not None else None,
+        )
+        return self._execution_data(data, "scenario", "scenario_steps", "cases")
+
+    @staticmethod
+    def _execution_data(data: Any, *required: str) -> Dict[str, Any]:
+        if not isinstance(data, dict) or data.get("schema_version") != 1:
+            raise ValueError("云端执行数据版本不兼容，请升级云端服务")
+        if any(key not in data for key in (*required, "env_variables", "app_key_mapping")):
+            raise ValueError("云端执行数据不完整")
+        return data
 
     # ---------- 用例数据（本地执行前置） ----------
 
@@ -168,9 +234,11 @@ class CloudBridge:
     def download_package(self, package_id: int) -> bytes:
         """GET /api/packages/{id}/download → 包文件字节（APK/IPA）。"""
         with self._client() as client:
-            resp = client.get(self._url(f"/api/packages/{int(package_id)}/download"), headers=self.auth_headers)
-            resp.raise_for_status()
-            return resp.content
+            resp = client.get(
+                self._url(f"/api/packages/{int(package_id)}/download"), headers=self.auth_headers, timeout=_UPLOAD_TIMEOUT
+            )
+        resp.raise_for_status()
+        return resp.content
 
     # ---------- 模板图 ----------
 
@@ -212,10 +280,10 @@ class CloudBridge:
         for candidate in candidates:
             try:
                 with self._client() as client:
-                    resp = client.get(self._url(candidate), headers=self.auth_headers)
-                    if resp.status_code // 100 == 2 and resp.content:
-                        cached.write_bytes(resp.content)
-                        return str(cached)
+                    resp = client.get(self._url(candidate), headers=self.auth_headers, timeout=_UPLOAD_TIMEOUT)
+                if resp.status_code // 100 == 2 and resp.content:
+                    cached.write_bytes(resp.content)
+                    return str(cached)
             except Exception as exc:
                 logger.debug("模板下载失败 %s: %s", candidate, exc)
         raise FileNotFoundError(f"图像文件不存在且云端拉取失败: {target}")
@@ -240,13 +308,21 @@ class CloudBridge:
     # ---------- client-runs 上报 ----------
 
     def create_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.post_json("/api/client-runs/", payload)
+        return self.post_json("/api/client-runs/", payload, timeout=CREATE_RUN_TIMEOUT)
+
+    async def create_run_async(self, payload: Dict[str, Any], client: httpx.AsyncClient) -> Dict[str, Any]:
+        """同步启动阶段使用主循环的连接池，取消等待时同时取消实际 HTTP 请求。"""
+        response = await client.post(
+            self._url("/api/client-runs/"), json=payload, headers=self.auth_headers, timeout=CREATE_RUN_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {}
 
     def report_steps(self, run_key: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.post_json(f"/api/client-runs/{run_key}/steps", payload)
+        return self.post_json(f"/api/client-runs/{run_key}/steps", payload, timeout=_UPLOAD_TIMEOUT)
 
     def finish_run(self, run_key: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self.post_json(f"/api/client-runs/{run_key}/finish", payload)
+        return self.post_json(f"/api/client-runs/{run_key}/finish", payload, timeout=_UPLOAD_TIMEOUT)
 
     # ---------- client-fastbot 上报（P3-2：采集本地 + 结果上报云端） ----------
 
@@ -256,7 +332,7 @@ class CloudBridge:
 
     def finish_client_fastbot(self, task_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         """POST /api/client-fastbot/{id}/finish（status + report 六列）。"""
-        return self.post_json(f"/api/client-fastbot/{int(task_id)}/finish", payload)
+        return self.post_json(f"/api/client-fastbot/{int(task_id)}/finish", payload, timeout=_UPLOAD_TIMEOUT)
 
     def upload_client_fastbot_artifact(
         self, task_id: int, file_path: str, rel_path: str

@@ -1,4 +1,4 @@
-# 来源：AutoDroid backend/utils/image_match.py（vendor）。剥离点：无。
+# 来源：AutoDroid backend/utils/image_match.py（vendor）。
 """Strict, device-independent image localization. Scores are not probabilities.
 
 All geometry is in original screenshot pixels. This module never dispatches taps.
@@ -29,8 +29,10 @@ def matcher_capabilities() -> Dict[str, Any]:
     try:
         _load_cv_stack()
     except RuntimeError:
-        return {"version": MATCHER_VERSION, "validated": False, "preview": False, "metadata": True}
-    return {"version": MATCHER_VERSION, "validated": True, "preview": True, "metadata": True}
+        return {"version": MATCHER_VERSION, "validated": False, "preview": False, "metadata": True,
+                "profiles": ["strict-v1"], "descriptor_versions": []}
+    return {"version": MATCHER_VERSION, "validated": True, "preview": True, "metadata": True,
+            "profiles": ["strict-v1", "adaptive-v2"], "descriptor_versions": [1]}
 
 
 def _result(status: str, reason: str, quality=None, candidates=None, started=None) -> Dict[str, Any]:
@@ -44,7 +46,11 @@ def _edges(gray):
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     magnitude = cv2.magnitude(gx, gy)
-    threshold = max(8.0, float(np.percentile(magnitude, 90)) * 0.25)
+    # Measure contrast among actual gradients. On a sparse icon the full-image
+    # percentile is background (often zero), so JPEG ringing would otherwise
+    # become contour evidence and reject the same icon in a lossless frame.
+    signal = magnitude[magnitude >= 8.0]
+    threshold = max(8.0, float(np.percentile(signal, 90)) * 0.25) if signal.size else 8.0
     edge = (magnitude >= threshold).astype(np.uint8)
     # Ignore padding derivatives; there is no evidence outside the template.
     edge[[0, -1], :] = 0

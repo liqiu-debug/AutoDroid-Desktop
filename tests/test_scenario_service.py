@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from engine import config_store, presence
-from engine.app import create_app
+from safe_lifespan import create_test_app as create_app
 from engine.core import run_registry, runner_service, scenario_service
 
 
@@ -70,6 +70,18 @@ class FakeScenarioBridge:
 
     def fetch_app_key_mapping(self):
         return {}
+
+    def fetch_scenario_execution_data(self, scenario_id, env_id=None):
+        steps = self.fetch_scenario_steps(scenario_id)
+        return {
+            "schema_version": 1, "scenario": self.fetch_scenario(scenario_id),
+            "scenario_steps": steps,
+            "cases": {
+                str(case_id): {"case": self.fetch_case(case_id), "standard_steps": self.fetch_case_steps(case_id)}
+                for case_id in {step["case_id"] for step in steps} if case_id not in self.fail_case_ids
+            },
+            "env_variables": self.fetch_env_variables(env_id), "app_key_mapping": {},
+        }
 
     def ensure_template_local(self, path):
         return f"/cache/{path.rsplit('/', 1)[-1]}"
@@ -281,22 +293,21 @@ def test_scenario_missing_case_continues_with_later_cases(fake_runner):
     assert finish_payload["status"] == "FAIL"
 
 
-def test_scenario_fetch_error_distinct_message_and_continues(fake_runner):
-    """S3：取用例瞬时失败（非 404 异常）与「用例不存在」文案区分，同样 continue。"""
+def test_scenario_aggregate_fetch_error_is_not_misreported_as_missing_case(fake_runner):
+    """整个聚合请求失败不能被当成缺失引用，避免混用部分/过期数据。"""
 
     class FlakyBridge(FakeScenarioBridge):
-        def fetch_case(self, case_id):
-            if case_id == 11:
-                raise RuntimeError("503 upstream unavailable")
-            return super().fetch_case(case_id)
+        def fetch_scenario_execution_data(self, scenario_id, env_id=None):
+            raise RuntimeError("503 upstream unavailable")
 
     bridge = FlakyBridge()
     result, messages, bridge = _run_scenario(bridge=bridge)
     assert result["success"] is False
-    assert [payload.get("case_id") for _, payload in bridge.step_payloads] == [22], "后续用例仍执行"
-    warnings = [m for m in messages if m.get("type") == "log" and m.get("level") == "warning"]
-    assert any("拉取用例失败" in m["message"] and "503" in m["message"] for m in warnings)
-    assert not any("用例不存在" in m["message"] for m in warnings)
+    assert result["status"] == "ERROR"
+    assert bridge.step_payloads == []
+    errors = [m for m in messages if m.get("type") == "log" and m.get("level") == "error"]
+    assert any("拉取场景数据失败" in m["message"] and "503" in m["message"] for m in errors)
+    assert not any("用例不存在" in m["message"] for m in errors)
 
 
 def test_scenario_all_skipped_finishes_with_warning_status(fake_runner):
@@ -438,10 +449,10 @@ def test_scenario_preset_fetch_failure_finishes_cloud_record(fake_runner):
     """
     bridge = FakeScenarioBridge()
 
-    def _fetch_boom(scenario_id):
+    def _fetch_boom(scenario_id, env_id=None):
         raise RuntimeError("cloud 502")
 
-    bridge.fetch_scenario = _fetch_boom
+    bridge.fetch_scenario_execution_data = _fetch_boom
     result, messages, bridge = _run_scenario(bridge=bridge, preset_run_key=501)
 
     assert result["success"] is False and result["status"] == "ERROR"
@@ -461,7 +472,7 @@ def test_scenario_batch_fetch_failure_finishes_preset_record(fake_runner, monkey
     finished = []
     done = threading.Event()
 
-    def _fetch_boom(self, scenario_id):
+    def _fetch_boom(self, scenario_id, env_id=None):
         raise RuntimeError("cloud 502")
 
     def _finish_run(self, run_key, payload):
@@ -469,7 +480,7 @@ def test_scenario_batch_fetch_failure_finishes_preset_record(fake_runner, monkey
         done.set()
         return {"report_id": None}
 
-    monkeypatch.setattr(cloud_bridge.CloudBridge, "fetch_scenario", _fetch_boom)
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "fetch_scenario_execution_data", _fetch_boom)
     monkeypatch.setattr(cloud_bridge.CloudBridge, "finish_run", _finish_run)
 
     scenario_service.start_background_scenario_run(
@@ -536,7 +547,7 @@ def test_scenario_run_batch_endpoint_shape(client, monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {
             "ok": serial != "BAD",
             "cases": [] if serial != "BAD" else [{"alias": "a", "case_name": "c", "status": "FAIL", "reason": "boom"}],
             "has_runnable_cases": serial != "BAD",
@@ -546,11 +557,18 @@ def test_scenario_run_batch_endpoint_shape(client, monkeypatch):
         scenario_service, "start_background_scenario_run", lambda **kwargs: started.append(kwargs)
     )
 
-    # 端点用真实 CloudBridge 拉场景存在性/预创建执行记录 → 类级替换
+    # 端点只拉聚合数据；预创建使用主循环的异步客户端。
     from engine.core import cloud_bridge
 
-    monkeypatch.setattr(cloud_bridge.CloudBridge, "fetch_scenario", lambda self, sid: {"id": sid, "name": "巡检场景"})
-    monkeypatch.setattr(cloud_bridge.CloudBridge, "create_run", lambda self, payload: {"id": 101, "run_id": payload["run_id"]})
+    monkeypatch.setattr(
+        cloud_bridge.CloudBridge, "fetch_scenario_execution_data",
+        lambda self, sid, env_id=None: FakeScenarioBridge().fetch_scenario_execution_data(sid, env_id),
+    )
+
+    async def create(self, payload, client):
+        return {"id": 101, "run_id": payload["run_id"]}
+
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "create_run_async", create)
 
     resp = client.post(
         "/api/scenarios/7/run",
@@ -578,7 +596,7 @@ def test_scenario_run_batch_execution_ids_exclude_nulls(client, monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": True, "cases": [], "has_runnable_cases": True},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": True, "cases": [], "has_runnable_cases": True},
     )
     started = []
     monkeypatch.setattr(
@@ -587,15 +605,16 @@ def test_scenario_run_batch_execution_ids_exclude_nulls(client, monkeypatch):
     from engine.core import cloud_bridge
 
     monkeypatch.setattr(
-        cloud_bridge.CloudBridge, "fetch_scenario", lambda self, sid: {"id": sid, "name": "巡检场景"}
+        cloud_bridge.CloudBridge, "fetch_scenario_execution_data",
+        lambda self, sid, env_id=None: FakeScenarioBridge().fetch_scenario_execution_data(sid, env_id),
     )
 
-    def _create(self, payload):
+    async def _create(self, payload, client):
         if payload.get("device_serial") == "USB2":
             raise RuntimeError("cloud down")
         return {"id": 101, "run_id": payload["run_id"]}
 
-    monkeypatch.setattr(cloud_bridge.CloudBridge, "create_run", _create)
+    monkeypatch.setattr(cloud_bridge.CloudBridge, "create_run_async", _create)
 
     resp = client.post("/api/scenarios/7/run", json={"device_serials": ["USB1", "USB2"]})
     assert resp.status_code == 200
@@ -612,11 +631,14 @@ def test_scenario_run_batch_all_precheck_failed(client, monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": False, "cases": [], "has_runnable_cases": False},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": False, "cases": [], "has_runnable_cases": False},
     )
     from engine.core import cloud_bridge
 
-    monkeypatch.setattr(cloud_bridge.CloudBridge, "fetch_scenario", lambda self, sid: {"id": sid, "name": "巡检场景"})
+    monkeypatch.setattr(
+        cloud_bridge.CloudBridge, "fetch_scenario_execution_data",
+        lambda self, sid, env_id=None: FakeScenarioBridge().fetch_scenario_execution_data(sid, env_id),
+    )
 
     resp = client.post("/api/scenarios/7/run", json={"device_serials": ["USB1"]})
     assert resp.status_code == 400
@@ -636,13 +658,19 @@ def test_scenario_ws_precheck_failure_blocks_run(client, monkeypatch):
     monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {
             "ok": False,
             "cases": [{"alias": "A", "case_name": "c", "status": "FAIL", "reason": "设备不匹配"}],
             "has_runnable_cases": False,
         },
     )
     monkeypatch.setattr(scenario_service, "run_scenario_local", _fail_run)
+    from engine.core import cloud_bridge
+
+    monkeypatch.setattr(
+        cloud_bridge.CloudBridge, "fetch_scenario_execution_data",
+        lambda self, sid, env_id=None: FakeScenarioBridge().fetch_scenario_execution_data(sid, env_id),
+    )
 
     with client.websocket_connect("/api/scenarios/ws/run/7?device_serial=USB1") as ws:
         log = ws.receive_json()
@@ -705,15 +733,10 @@ def test_scenario_ws_run_registers_and_can_be_cancelled(client, monkeypatch, moc
     )
     monkeypatch.setattr(
         cloud_bridge.CloudBridge,
-        "fetch_scenario",
-        lambda self, sid: {"id": sid, "name": "巡检场景"},
-    )
-    monkeypatch.setattr(
-        cloud_bridge.CloudBridge,
-        "fetch_scenario_steps",
-        lambda self, sid: [
-            {"id": 1, "scenario_id": sid, "case_id": 5, "order": 1, "alias": "A"},
-        ],
+        "fetch_scenario_execution_data",
+        lambda self, sid, env_id=None: FakeScenarioBridge(scenario_steps=[
+            {"id": 1, "scenario_id": sid, "case_id": 11, "order": 1, "alias": "A"},
+        ]).fetch_scenario_execution_data(sid, env_id),
     )
 
     result_holder = {}
@@ -723,11 +746,11 @@ def test_scenario_ws_run_registers_and_can_be_cancelled(client, monkeypatch, moc
             async def emit(message):
                 result_holder.setdefault("messages", []).append(message)
 
-            bridge = cloud_bridge.CloudBridge()
-            result_holder["result"] = await scenario_service.run_scenario_local(
-                scenario_id=7, env_id=None, device_serial="USB1", run_id="r-sc", batch_id="b-sc",
-                emit=emit, bridge=bridge,
-            )
+            with cloud_bridge.CloudBridge() as bridge:
+                result_holder["result"] = await scenario_service.run_scenario_local(
+                    scenario_id=7, env_id=None, device_serial="USB1", run_id="r-sc", batch_id="b-sc",
+                    emit=emit, bridge=bridge,
+                )
 
         asyncio.run(_run())
 

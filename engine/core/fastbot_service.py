@@ -456,9 +456,12 @@ def run_and_report(
     enable_performance_monitor: bool,
     event_weights: Optional[Dict[str, Any]] = None,
     enable_local_replay: bool = True,
+    upstream: Optional[str] = None,
 ) -> None:
     """后台线程入口：本地采集 → 回放产物上传 → client-fastbot finish 收尾（异常也收尾 FAILED）。"""
     weights = dict(event_weights or {})
+    task_upstream = upstream if upstream is not None else config_store.get_upstream() or ""
+    task_headers = dict(auth_headers)
 
     def _thread_main() -> None:
         try:
@@ -523,26 +526,26 @@ def run_and_report(
             }
 
         summary = report.get("summary") or {}
-        bridge = CloudBridge(auth_headers=auth_headers)
-        if report.get("crash_events"):
-            # 回放视频随报告一并云端化：报告在任何入口都能直接播放
+        with CloudBridge(upstream=task_upstream, auth_headers=task_headers) as bridge:
+            if report.get("crash_events"):
+                # 回放视频随报告一并云端化：报告在任何入口都能直接播放
+                try:
+                    publish_local_replays(bridge, task_id, report)
+                except Exception as exc:
+                    logger.warning("回放产物上传阶段异常（已忽略）: %s", exc)
             try:
-                publish_local_replays(bridge, task_id, report)
+                bridge.finish_client_fastbot(
+                    task_id,
+                    {
+                        "status": status,
+                        "total_crashes": int(summary.get("total_crashes") or 0),
+                        "total_anrs": int(summary.get("total_anrs") or 0),
+                        "finished_at": _now_iso(),
+                        "report": report,
+                    },
+                )
             except Exception as exc:
-                logger.warning("回放产物上传阶段异常（已忽略）: %s", exc)
-        try:
-            bridge.finish_client_fastbot(
-                task_id,
-                {
-                    "status": status,
-                    "total_crashes": int(summary.get("total_crashes") or 0),
-                    "total_anrs": int(summary.get("total_anrs") or 0),
-                    "finished_at": _now_iso(),
-                    "report": report,
-                },
-            )
-        except Exception as exc:
-            logger.warning("client-fastbot 收尾上报失败（结果仅本地日志可见）: %s", exc)
+                logger.warning("client-fastbot 收尾上报失败（结果仅本地日志可见）: %s", exc)
         logger.info(
             "Fastbot 本地执行收尾: task=%s status=%s duration=%.1fs crashes=%s anrs=%s replay=%s replay_status=%s",
             task_id,
@@ -647,6 +650,7 @@ def _create_and_start(
     run_and_report(
         task_id=task_id,
         auth_headers=dict(bridge.auth_headers),
+        upstream=bridge.upstream,
         device_serial=device_serial,
         package_name=package_name,
         duration=duration,

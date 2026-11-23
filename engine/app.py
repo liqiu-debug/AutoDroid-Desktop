@@ -29,6 +29,7 @@ from starlette.websockets import WebSocket
 
 from engine import config_store, presence
 from engine.core import device_busy
+from engine.core.launch_requests import ENGINE_INSTANCE_ID, LaunchRequestRegistry
 from engine.device_scan import all_local_serials as local_serials, scan_all_devices as scan_devices
 from engine.local_api import router as local_api_router
 from engine.proxy import (
@@ -241,6 +242,7 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            await app.state.launch_requests.close(grace_period=35.0)
             # 进程退出/托盘退出（SIGTERM → lifespan shutdown）时 best-effort
             # 把本实例登记的设备置 OFFLINE，再停心跳、关设备流、关 HTTP 客户端。
             for background in (app.state.device_discovery, app.state.local_presence, app.state.presence_heal):
@@ -277,6 +279,7 @@ def create_app() -> FastAPI:
             await app.state.http.aclose()
 
     app = FastAPI(title="AutoDroid Desktop Engine", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.launch_requests = LaunchRequestRegistry()
 
     # 本地设备 I/O / 本地执行路由必须先于 /{path:path} 与 /ws/{path:path} 注册
     # （Starlette 按注册顺序匹配），否则会被反代兜底吞掉。
@@ -287,6 +290,8 @@ def create_app() -> FastAPI:
         from engine.core.utils.image_match import matcher_capabilities
         return JSONResponse(
             content={"clientMode": True, "platform": platform_name(), "version": client_version(),
+                     "execution_preflight_v1": True, "launch_idempotency": True,
+                     "engine_instance_id": ENGINE_INSTANCE_ID,
                      "image_matcher": matcher_capabilities()}
         )
 

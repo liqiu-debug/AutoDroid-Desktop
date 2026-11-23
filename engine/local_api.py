@@ -36,12 +36,17 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from fastapi import APIRouter, Body, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from engine.core import recording_service
 from engine.core.cloud_bridge import CloudBridge, auth_headers_from_request, template_cache_dir
+from engine.core.launch_requests import (
+    ENGINE_INSTANCE_ID, LaunchRequestRegistry, launch_fingerprint, launch_ids, session_scope,
+)
 from engine.core.recording_service import RecordingError
 from engine.core.utils.image_match_preview import crop_metadata, preview_image_match
 
@@ -179,29 +184,29 @@ async def interact_with_device(request: Request, payload: InteractionPayload) ->
 @router.post("/device/execute_step", include_in_schema=False)
 async def execute_single_step(request: Request, payload: SingleStepPayload) -> Response:
     """执行单个步骤并返回最新 UI 快照（本地跨端 Runner）。"""
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    env_variables: Dict[str, str] = {}
-    if payload.env_id:
-        try:
-            env_variables = await _to_thread(bridge.fetch_env_variables, payload.env_id)
-        except Exception as exc:
-            logger.warning("拉取环境变量失败（按空继续）: %s", exc)
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        env_variables: Dict[str, str] = {}
+        if payload.env_id:
+            try:
+                env_variables = await _to_thread(bridge.fetch_env_variables, payload.env_id)
+            except Exception as exc:
+                logger.warning("拉取环境变量失败（按空继续）: %s", exc)
 
-    try:
-        result = await _to_thread(
-            recording_service.execute_single_step,
-            step=payload.step,
-            device_serial=payload.device_serial,
-            case_id=payload.case_id,
-            env_variables=env_variables,
-            variables=payload.variables,
-            include_screenshot=payload.include_screenshot,
-            include_device_info=payload.include_device_info,
-            ensure_local=bridge.ensure_template_local,
-        )
-    except RecordingError as exc:
-        return _error_response(exc)
-    return _json_response_with_optional_gzip(request, result)
+        try:
+            result = await _to_thread(
+                recording_service.execute_single_step,
+                step=payload.step,
+                device_serial=payload.device_serial,
+                case_id=payload.case_id,
+                env_variables=env_variables,
+                variables=payload.variables,
+                include_screenshot=payload.include_screenshot,
+                include_device_info=payload.include_device_info,
+                ensure_local=bridge.ensure_template_local,
+            )
+        except RecordingError as exc:
+            return _error_response(exc)
+        return _json_response_with_optional_gzip(request, result)
 
 
 @router.get("/api/devices/{serial}/screenshot")
@@ -338,37 +343,38 @@ async def crop_template(request: Request, payload: CropTemplatePayload) -> JSONR
     except RecordingError as exc:
         return _error_response(exc)
 
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    if not bridge.available:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "未配置上游服务器，模板无法上云保存，请先登录后重试"},
-        )
-    try:
-        image_path = await _to_thread(bridge.upload_template, image_bytes, suggested_name)
-    except Exception as exc:
-        logger.warning("模板上传云端失败（阻断返回，避免悬空引用）: %s", exc)
-        return JSONResponse(
-            status_code=502,
-            content={"detail": f"模板上传云端失败，请重试：{exc}"},
-        )
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        if not bridge.available:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "未配置上游服务器，模板无法上云保存，请先登录后重试"},
+            )
+        try:
+            image_path = await _to_thread(bridge.upload_template, image_bytes, suggested_name)
+        except Exception as exc:
+            logger.warning("模板上传云端失败（阻断返回，避免悬空引用）: %s", exc)
+            return JSONResponse(
+                status_code=502,
+                content={"detail": f"模板上传云端失败，请重试：{exc}"},
+            )
 
-    # 本地缓存按云端文件名保存，供本地执行引用（无需回源）
-    cache_name = image_path.rsplit("/", 1)[-1] or suggested_name
-    try:
-        (template_cache_dir() / cache_name).write_bytes(image_bytes)
-    except Exception:
-        logger.warning("模板本地缓存写入失败", exc_info=True)
+        # 本地缓存按云端文件名保存，供本地执行引用（无需回源）
+        cache_name = image_path.rsplit("/", 1)[-1] or suggested_name
+        try:
+            (template_cache_dir() / cache_name).write_bytes(image_bytes)
+        except Exception:
+            logger.warning("模板本地缓存写入失败", exc_info=True)
 
-    logger.info("手动截取模板图已保存: %s (%s bytes)", image_path, len(image_bytes))
-    metadata = await _to_thread(crop_metadata, image_bytes, payload.screenshot_base64)
-    return JSONResponse(content={"image_path": image_path, **metadata})
+        logger.info("手动截取模板图已保存: %s (%s bytes)", image_path, len(image_bytes))
+        metadata = await _to_thread(crop_metadata, image_bytes, payload.screenshot_base64)
+        return JSONResponse(content={"image_path": image_path, **metadata})
 
 
 class MatchImagePayload(BaseModel):
     screenshot_base64: str
     image_path: str
     image_options: Optional[Dict[str, Any]] = None
+    image_match: Optional[Dict[str, Any]] = None
 
 
 @router.post("/api/device/match_image")
@@ -379,16 +385,16 @@ async def preview_match_image(request: Request, payload: MatchImagePayload) -> J
 
     if not re.fullmatch(r"static/images/[\w.-]+\.(?:png|jpe?g)", payload.image_path, flags=re.IGNORECASE):
         return JSONResponse(status_code=400, content={"detail": "模板路径无效，请重新截取"})
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    try:
-        path = await _to_thread(bridge.ensure_template_local, payload.image_path)
-        from pathlib import Path
-        result = await _to_thread(preview_image_match, payload.screenshot_base64, Path(path).read_bytes(), payload.image_options)
-        return JSONResponse(content=result)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
-    except Exception as exc:
-        return JSONResponse(status_code=502, content={"detail": f"模板读取失败: {exc}"})
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        try:
+            path = await _to_thread(bridge.ensure_template_local, payload.image_path)
+            from pathlib import Path
+            result = await _to_thread(preview_image_match, payload.screenshot_base64, Path(path).read_bytes(), payload.image_options, payload.image_match)
+            return JSONResponse(content=result)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"detail": f"模板读取失败: {exc}"})
 
 
 # --------------------------------------------------------------------------- #
@@ -414,117 +420,259 @@ def _run_payload(case_id: int, batch_id: str, run_id: str, device_serial: str, m
     }
 
 
+# Cloud record preparation has a batch deadline independent of device count.
+CREATE_RECORD_DEADLINE_SECONDS = 10.0
+CREATE_RECORD_CONCURRENCY = 4
+
+
+def _execution_data_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        try:
+            detail = exc.response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        if status == 404 and detail in (None, "Not Found", "Not found"):
+            detail = "云端尚未提供执行数据接口，请先升级云端服务"
+        return JSONResponse(status_code=status if status in (401, 403, 404) else 502,
+                            content={"detail": detail or "云端执行数据读取失败，请稍后重试"})
+    if isinstance(exc, httpx.TimeoutException):
+        return JSONResponse(status_code=504, content={"detail": "读取执行数据超时，尚未启动执行，请稍后重试"})
+    return JSONResponse(status_code=502, content={"detail": f"读取执行数据失败：{exc}"})
+
+
+def _device_serials(values: List[Optional[str]]) -> List[Optional[str]]:
+    # Deduplicate data/launch work while retaining the user's response order.
+    return list(dict.fromkeys(str(value).strip() or None if value is not None else None for value in values))
+
+
+async def _precreate_scenario_records(
+    bridge: CloudBridge, client: httpx.AsyncClient, payloads: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    semaphore = asyncio.Semaphore(CREATE_RECORD_CONCURRENCY)
+    confirmed: Dict[str, Any] = {}
+    attempted: Dict[str, Dict[str, Any]] = {}
+
+    async def create(payload: Dict[str, Any]) -> None:
+        try:
+            async with semaphore:
+                attempted[payload["device_serial"]] = payload
+                result = await bridge.create_run_async(payload, client)
+                if (result or {}).get("id") is not None:
+                    confirmed[payload["device_serial"]] = result["id"]
+        except Exception as exc:
+            logger.warning("云端执行记录尚未确认，本地沿用同一 run_id 继续：%s", exc)
+
+    tasks = [asyncio.create_task(create(payload)) for payload in payloads]
+    interrupted = False
+    try:
+        if tasks:
+            await asyncio.wait(tasks, timeout=CREATE_RECORD_DEADLINE_SECONDS)
+    except asyncio.CancelledError:
+        interrupted = True
+        raise
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if interrupted and attempted:
+            # A disconnect on legacy callers or a forced shutdown can happen
+            # after the cloud committed a record but before its response arrived.
+            # Resolve only attempted IDs, then finish them; no device is started.
+            async def abort_unstarted(serial, payload):
+                try:
+                    async with semaphore:
+                        key = confirmed.get(serial)
+                        if key is None:
+                            result = await bridge.create_run_async(payload, client)
+                            key = (result or {}).get("id")
+                        if key is not None:
+                            response = await client.post(
+                                bridge._url(f"/api/client-runs/{key}/finish"), headers=bridge.auth_headers,
+                                json={"status": "ABORTED", "aborted": True, "duration": 0,
+                                      "error": "启动准备已取消，未执行设备操作"}, timeout=2.0,
+                            )
+                            response.raise_for_status()
+                except Exception:
+                    logger.warning("取消启动后的云端记录收尾未确认", exc_info=True)
+
+            cleanup = [asyncio.create_task(abort_unstarted(serial, payload)) for serial, payload in attempted.items()]
+            try:
+                await asyncio.wait(cleanup, timeout=2.0)
+            finally:
+                for task in cleanup:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*cleanup, return_exceptions=True)
+    return confirmed
+
+
+async def _submit_execution(
+    request: Request, kind: str, target_id: int, env_id: Optional[int],
+    device_serials: List[Optional[str]], *, single: bool = False,
+) -> JSONResponse:
+    from engine.core import runner_service, scenario_service
+
+    request_id = (request.headers.get("Idempotency-Key") or "").strip() or None
+    instance = request.headers.get("X-AutoDroid-Engine-Instance")
+    if instance is not None and instance != ENGINE_INSTANCE_ID:
+        return JSONResponse(status_code=409, content={"detail": {
+            "code": "L1002_ENGINE_INSTANCE_CHANGED",
+            "message": "桌面引擎已重启，请查看原执行记录后重新操作",
+        }})
+    if request_id and not instance:
+        return JSONResponse(status_code=400, content={"detail": {
+            "code": "L1003_ENGINE_INSTANCE_REQUIRED", "message": "启动请求缺少桌面实例标识，请刷新后重试",
+        }})
+    if request_id and len(request_id) > 256:
+        return JSONResponse(status_code=400, content={"detail": "启动请求编号过长"})
+
+    headers = auth_headers_from_request(request)
+    from engine import config_store
+
+    upstream = config_store.get_upstream() or ""
+    serials = _device_serials(device_serials or [None])
+    scope = session_scope(upstream, headers)
+    batch_id, device_run_id = launch_ids(scope, request_id)
+
+    async def launch() -> JSONResponse:
+        with CloudBridge(upstream=upstream, auth_headers=headers) as bridge:
+            try:
+                fetch = bridge.fetch_case_execution_data if kind == "case" else bridge.fetch_scenario_execution_data
+                data = await _to_thread(fetch, target_id, env_id)
+            except Exception as exc:
+                return _execution_data_error(exc)
+
+            runnable: List[str] = []
+            blocked: List[Dict[str, Any]] = []
+            check_device = runner_service.precheck_for_device if kind == "case" else scenario_service.precheck_scenario_for_device
+            for serial in serials:
+                if not serial:
+                    blocked.append({"device_serial": serial, "reason": "请选择执行设备"})
+                    continue
+                try:
+                    check = await _to_thread(check_device, bridge, target_id, serial, env_id, execution_data=data)
+                except Exception as exc:
+                    blocked.append({"device_serial": serial, "reason": f"预检异常：{exc}"})
+                    continue
+                if check.get("ok"):
+                    runnable.append(serial)
+                else:
+                    blocked.append({"device_serial": serial, "reason": scenario_service.summarize_precheck_failure(check),
+                                    "precheck": check})
+            if not runnable:
+                return JSONResponse(status_code=400, content={"detail": {
+                    "code": "C1001_CASE_PRECHECK_FAILED" if kind == "case" else "S1001_SCENARIO_PRECHECK_FAILED",
+                    "message": "运行前预检未通过，所选设备均无法执行", "items": blocked,
+                }})
+
+            confirmed = {}
+            if kind == "scenario":
+                payloads = [{
+                    "run_id": device_run_id(serial), "kind": "scenario", "case_id": None,
+                    "scenario_id": target_id, "device_serial": serial, "platform": None,
+                    "run_source": "platform", "started_at": datetime.now().isoformat(),
+                    "name": None, "env_id": env_id,
+                } for serial in runnable]
+                confirmed = await _precreate_scenario_records(bridge, request.app.state.http, payloads)
+
+            runs: List[Dict[str, Any]] = []
+            failed_records = []
+            for serial in runnable:
+                run_id = device_run_id(serial)
+                key = confirmed.get(serial)
+                try:
+                    common = dict(env_id=env_id, device_serial=serial, run_id=run_id,
+                                  batch_id=batch_id, auth_headers=headers, upstream=upstream, execution_data=data)
+                    if kind == "case":
+                        runner_service.start_background_case_run(case_id=target_id, **common)
+                    else:
+                        scenario_service.start_background_scenario_run(scenario_id=target_id, preset_run_key=key, **common)
+                except Exception:
+                    # Keep the launch key and other devices' outcomes. Never replay
+                    # workers that were successfully started before this failure.
+                    logger.exception("本地执行线程启动失败：kind=%s target=%s", kind, target_id)
+                    blocked.append({"device_serial": serial, "reason": "本地执行线程启动失败"})
+                    if kind == "scenario":
+                        failed_records.append((serial, key))
+                    continue
+                runs.append({"run_id": run_id, "execution_id": key, "device_serial": serial,
+                             "queued": False, "queue_position": None,
+                             "cloud_record_pending": kind == "scenario" and key is None})
+            if failed_records:
+                cleanup_slots = asyncio.Semaphore(CREATE_RECORD_CONCURRENCY)
+
+                async def finish_failed(serial, key):
+                    try:
+                        async with cleanup_slots:
+                            if key is None:
+                                payload = next(payload for payload in payloads if payload["device_serial"] == serial)
+                                created = await bridge.create_run_async(payload, request.app.state.http)
+                                key = (created or {}).get("id")
+                            if key is None:
+                                return
+                            response = await request.app.state.http.post(
+                                bridge._url(f"/api/client-runs/{key}/finish"), headers=headers,
+                                json={"status": "ERROR", "error": "本地执行线程启动失败", "duration": 0},
+                                timeout=2.0,
+                            )
+                            response.raise_for_status()
+                    except Exception:
+                        logger.warning("启动失败的云端记录收尾未确认", exc_info=True)
+
+                cleanup_tasks = [asyncio.create_task(finish_failed(serial, key)) for serial, key in failed_records]
+                try:
+                    await asyncio.wait(cleanup_tasks, timeout=2.0)
+                finally:
+                    for task in cleanup_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            if not runs:
+                return JSONResponse(status_code=500, content={"detail": {
+                    "code": "L1004_LAUNCH_RESULT_UNKNOWN", "message": "本地启动失败，请查看执行记录后重新操作",
+                    "items": blocked,
+                }})
+            if single:
+                response = _run_payload(target_id, batch_id, runs[0]["run_id"], runs[0]["device_serial"], "Execution started")
+                return JSONResponse(content={**response, "runs": runs, "blocked_prechecks": blocked})
+            return JSONResponse(content={
+                "message": "Batch execution started", "batch_id": batch_id,
+                **({"case_id": target_id, "run_ids": [row["run_id"] for row in runs],
+                    "device_serials": [row["device_serial"] for row in runs]} if kind == "case" else {}),
+                "execution_ids": [row["execution_id"] for row in runs if row["execution_id"] is not None],
+                "blocked_prechecks": blocked, "runs": runs, "queued_count": 0,
+            })
+
+    if request_id:
+        registry = getattr(request.app.state, "launch_requests", None)
+        if registry is None:
+            registry = request.app.state.launch_requests = LaunchRequestRegistry()
+        return await registry.submit(scope, request_id, launch_fingerprint(
+            f"{kind}:single" if single else kind, target_id, env_id, serials,
+        ), launch)
+    return await launch()
+
+
 @router.post("/api/cases/{case_id}/run")
 @router.post("/cases/{case_id}/run", include_in_schema=False)
 async def run_test_case(
-    request: Request,
-    case_id: int,
-    env_id: Optional[int] = None,
-    device_serial: Optional[str] = None,
+    request: Request, case_id: int, env_id: Optional[int] = None, device_serial: Optional[str] = None,
 ) -> JSONResponse:
-    """Quick run a test case in background（本地执行 + client-runs 上报）。"""
-    from engine.core import runner_service
-
+    """Precheck once and pass the exact input snapshot to the background runner."""
     if not device_serial:
         return JSONResponse(status_code=400, content={"detail": "请选择执行设备"})
-
-    import uuid
-
-    run_id = str(uuid.uuid4())
-    batch_id = str(uuid.uuid4())
-    runner_service.start_background_case_run(
-        case_id=case_id,
-        env_id=env_id,
-        device_serial=device_serial,
-        run_id=run_id,
-        batch_id=batch_id,
-        auth_headers=auth_headers_from_request(request),
-    )
-    return JSONResponse(content=_run_payload(case_id, batch_id, run_id, device_serial, "Execution started"))
+    return await _submit_execution(request, "case", case_id, env_id, [device_serial], single=True)
 
 
 @router.post("/api/cases/{case_id}/run-batch")
 @router.post("/cases/{case_id}/run-batch", include_in_schema=False)
 async def run_test_case_batch(
-    request: Request,
-    case_id: int,
-    payload: CaseRunBatchPayload = Body(default_factory=CaseRunBatchPayload),
+    request: Request, case_id: int, payload: CaseRunBatchPayload = Body(default_factory=CaseRunBatchPayload),
 ) -> JSONResponse:
-    """Run one case on multiple devices as one batch（形状对齐 cases.py run_test_case_batch）。"""
-    import uuid
-
-    from engine.core import runner_service
-
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-
-    requested_serials = payload.device_serials or [None]
-    runnable_serials: List[str] = []
-    blocked_prechecks: List[Dict[str, Any]] = []
-    for serial in requested_serials:
-        if not serial:
-            blocked_prechecks.append({"device_serial": serial, "reason": "请选择执行设备"})
-            continue
-        try:
-            precheck = await _to_thread(
-                runner_service.precheck_for_device, bridge, case_id, serial, payload.env_id
-            )
-        except Exception as exc:
-            detail = str(exc)
-            if "404" in detail:
-                return JSONResponse(status_code=404, content={"detail": "用例不存在"})
-            blocked_prechecks.append({"device_serial": serial, "reason": detail})
-            continue
-        if precheck.get("ok"):
-            runnable_serials.append(serial)
-        else:
-            blocked_prechecks.append(
-                {
-                    "device_serial": serial,
-                    "reason": "case precheck failed",
-                    "precheck": precheck,
-                }
-            )
-
-    if not runnable_serials:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "detail": {
-                    "code": "C1001_CASE_PRECHECK_FAILED",
-                    "message": "case precheck failed for all selected devices",
-                    "items": blocked_prechecks,
-                }
-            },
-        )
-
-    batch_id = str(uuid.uuid4())
-    run_ids: List[str] = []
-    runs_payload: List[Dict[str, Any]] = []
-    for serial in runnable_serials:
-        run_id = str(uuid.uuid4())
-        run_ids.append(run_id)
-        runs_payload.append({"run_id": run_id, "device_serial": serial, "queued": False, "queue_position": None})
-        runner_service.start_background_case_run(
-            case_id=case_id,
-            env_id=payload.env_id,
-            device_serial=serial,
-            run_id=run_id,
-            batch_id=batch_id,
-            auth_headers=auth_headers_from_request(request),
-        )
-
-    return JSONResponse(
-        content={
-            "message": "Batch execution started",
-            "case_id": case_id,
-            "batch_id": batch_id,
-            "run_ids": run_ids,
-            "device_serials": runnable_serials,
-            "blocked_prechecks": blocked_prechecks,
-            "runs": runs_payload,
-            "queued_count": 0,
-        }
-    )
+    return await _submit_execution(request, "case", case_id, payload.env_id, payload.device_serials or [None])
 
 
 @router.websocket("/ws/run/{case_id}")
@@ -567,15 +715,12 @@ async def precheck_case(
     """本地预检（不再反代云端：云端 WDA/设备探测与本地执行语义不符）。"""
     from engine.core import runner_service
 
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    try:
-        payload = await _to_thread(runner_service.precheck_for_device, bridge, case_id, device_serial, env_id)
-    except Exception as exc:
-        detail = str(exc)
-        if "404" in detail:
-            return JSONResponse(status_code=404, content={"detail": "用例不存在"})
-        return JSONResponse(status_code=502, content={"detail": f"预检失败: {detail}"})
-    return JSONResponse(content=payload)
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        try:
+            payload = await _to_thread(runner_service.precheck_for_device, bridge, case_id, device_serial, env_id)
+        except Exception as exc:
+            return _execution_data_error(exc)
+        return JSONResponse(content=payload)
 
 
 class CancelRunPayload(BaseModel):
@@ -654,135 +799,22 @@ async def precheck_scenario(
     """场景本地预检（形状对齐 scenarios.precheck_scenario_execution）。"""
     from engine.core import scenario_service
 
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    try:
-        payload = await _to_thread(
-            scenario_service.precheck_scenario_for_device, bridge, scenario_id, device_serial, env_id
-        )
-    except Exception as exc:
-        detail = str(exc)
-        if "404" in detail:
-            return JSONResponse(status_code=404, content={"detail": "场景不存在"})
-        return JSONResponse(status_code=502, content={"detail": f"预检失败: {detail}"})
-    return JSONResponse(content=payload)
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        try:
+            payload = await _to_thread(
+                scenario_service.precheck_scenario_for_device, bridge, scenario_id, device_serial, env_id
+            )
+        except Exception as exc:
+            return _execution_data_error(exc)
+        return JSONResponse(content=payload)
 
 
 @router.post("/api/scenarios/{scenario_id}/run")
 @router.post("/scenarios/{scenario_id}/run", include_in_schema=False)
 async def run_scenario_batch(
-    request: Request,
-    scenario_id: int,
-    payload: ScenarioRunBatchPayload = Body(default_factory=ScenarioRunBatchPayload),
+    request: Request, scenario_id: int, payload: ScenarioRunBatchPayload = Body(default_factory=ScenarioRunBatchPayload),
 ) -> JSONResponse:
-    """场景在多设备上的批量执行（响应形状对齐 scenarios.run_scenario_api）。"""
-    import uuid as _uuid
-
-    from engine.core import scenario_service
-
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    try:
-        await _to_thread(bridge.fetch_scenario, scenario_id)
-    except Exception as exc:
-        detail = str(exc)
-        if "404" in detail:
-            return JSONResponse(status_code=404, content={"detail": "场景不存在"})
-        return JSONResponse(status_code=502, content={"detail": f"拉取场景失败: {detail}"})
-
-    requested_serials = payload.device_serials or [None]
-    runnable_serials: List[str] = []
-    blocked_prechecks: List[Dict[str, Any]] = []
-    for serial in requested_serials:
-        if not serial:
-            blocked_prechecks.append({"device_serial": serial, "reason": "请选择执行设备"})
-            continue
-        try:
-            precheck = await _to_thread(
-                scenario_service.precheck_scenario_for_device, bridge, scenario_id, serial, payload.env_id
-            )
-        except Exception as exc:
-            blocked_prechecks.append({"device_serial": serial, "reason": str(exc)})
-            continue
-        if precheck.get("ok"):
-            runnable_serials.append(serial)
-        else:
-            blocked_prechecks.append(
-                {
-                    "device_serial": serial,
-                    "reason": scenario_service.summarize_precheck_failure(precheck),
-                    "precheck": precheck,
-                }
-            )
-
-    if not runnable_serials:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "detail": {
-                    "code": "S1001_SCENARIO_PRECHECK_FAILED",
-                    "message": "scenario precheck failed for all selected devices",
-                    "items": blocked_prechecks,
-                }
-            },
-        )
-
-    batch_id = str(_uuid.uuid4())
-    execution_ids: List[Any] = []
-    runs_payload: List[Dict[str, Any]] = []
-    for serial in runnable_serials:
-        run_id = str(_uuid.uuid4())
-        # 先在云端建执行记录（kind=scenario），拿到 execution_id 后随响应返回
-        # （形状对齐 scenarios.run_scenario_api 的 runs[]/execution_ids）。
-        context_key: Optional[Any] = None
-        try:
-            created = await _to_thread(
-                bridge.create_run,
-                {
-                    "run_id": run_id,
-                    "kind": "scenario",
-                    "case_id": None,
-                    "scenario_id": int(scenario_id),
-                    "device_serial": serial,
-                    "platform": None,
-                    "run_source": "platform",
-                    "started_at": datetime.now().isoformat(),
-                    "name": None,
-                    "env_id": payload.env_id,
-                },
-            )
-            context_key = (created or {}).get("id") or None
-        except Exception as exc:
-            logger.warning("client-runs 预创建失败（本地继续执行）: %s", exc)
-        # S6：仅有效 id 入 execution_ids（平台契约 List[int]，不得出现 null）
-        if context_key is not None:
-            execution_ids.append(context_key)
-        runs_payload.append(
-            {
-                "execution_id": context_key,
-                "device_serial": serial,
-                "queued": False,
-                "queue_position": None,
-            }
-        )
-        scenario_service.start_background_scenario_run(
-            scenario_id=scenario_id,
-            env_id=payload.env_id,
-            device_serial=serial,
-            run_id=run_id,
-            batch_id=batch_id,
-            auth_headers=auth_headers_from_request(request),
-            preset_run_key=context_key,
-        )
-
-    return JSONResponse(
-        content={
-            "message": "Batch execution started",
-            "batch_id": batch_id,
-            "execution_ids": execution_ids,
-            "blocked_prechecks": blocked_prechecks,
-            "runs": runs_payload,
-            "queued_count": 0,
-        }
-    )
+    return await _submit_execution(request, "scenario", scenario_id, payload.env_id, payload.device_serials or [None])
 
 
 @router.websocket("/api/scenarios/ws/run/{scenario_id}")
@@ -823,14 +855,14 @@ async def install_package_to_device(
 ) -> JSONResponse:
     from engine.core import package_service
 
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    try:
-        result = await _to_thread(
-            package_service.install_package_local, bridge, package_id, payload.serial
-        )
-    except package_service.PackageInstallError as exc:
-        return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
-    return JSONResponse(content=result)
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        try:
+            result = await _to_thread(
+                package_service.install_package_local, bridge, package_id, payload.serial
+            )
+        except package_service.PackageInstallError as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+        return JSONResponse(content=result)
 
 
 # --------------------------------------------------------------------------- #
@@ -885,22 +917,22 @@ async def run_fastbot_task_local(request: Request, payload: FastbotRunPayload) -
             return JSONResponse(status_code=400, content={"detail": "iOS 设备未通过 USB 连接或未信任本机"})
     elif not device_manager.get_device(device_serial):
         return JSONResponse(status_code=400, content={"detail": "设备不在线或未就绪"})
-    bridge = CloudBridge(auth_headers=auth_headers_from_request(request))
-    if not bridge.available:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "未配置上游服务器，Fastbot 结果无法上报，请先登录后重试"},
-        )
-    try:
-        created = await _to_thread(
-            fastbot_service.start_fastbot_run, bridge, payload.model_dump()
-        )
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"detail": str(exc)})
-    except Exception as exc:
-        logger.warning("Fastbot 本地启动失败: %s", exc)
-        return JSONResponse(status_code=502, content={"detail": f"Fastbot 启动失败：{exc}"})
-    return JSONResponse(content=created)
+    with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+        if not bridge.available:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "未配置上游服务器，Fastbot 结果无法上报，请先登录后重试"},
+            )
+        try:
+            created = await _to_thread(
+                fastbot_service.start_fastbot_run, bridge, payload.model_dump()
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        except Exception as exc:
+            logger.warning("Fastbot 本地启动失败: %s", exc)
+            return JSONResponse(status_code=502, content={"detail": f"Fastbot 启动失败：{exc}"})
+        return JSONResponse(content=created)
 
 
 # --------------------------------------------------------------------------- #

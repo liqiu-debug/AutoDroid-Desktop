@@ -18,6 +18,7 @@ from engine.core.step_contract import (
     normalize_retry_count,
 )
 from engine.core.utils.variable_render import format_variable_placeholder, render_step_data
+from engine.core.utils.image_match_options import preserve_image_references
 
 logger = logging.getLogger(__name__)
 _SUPPORTED_PLATFORMS = {"android", "ios"}
@@ -143,7 +144,7 @@ def render_with_variables(raw: Any, variables: Dict[str, str]) -> Any:
     if isinstance(raw, list):
         return [render_with_variables(item, variables) for item in raw]
     if isinstance(raw, dict):
-        return {k: render_with_variables(v, variables) for k, v in raw.items()}
+        return {k: v if k == "image_match" else render_with_variables(v, variables) for k, v in raw.items()}
     return raw
 
 
@@ -391,18 +392,23 @@ def _resolve_image_path(
     first_selector: str,
     value: Any,
 ) -> str:
+    overrides = step_item.get("platform_overrides")
+    current = overrides.get(platform) if isinstance(overrides, dict) else None
+    platform_image = current.get("selector") if isinstance(current, dict) and str(current.get("by") or "").lower() == "image" else None
     options = step_item.get("options")
     option_image_path = ""
     if isinstance(options, dict):
         option_image_path = _clean_text(options.get("image_path") or options.get("path"))
 
     return _clean_text(
-        args.get("image_path")
+        platform_image
+        or args.get("image_path")
         or args.get("path")
         or first_selector
         or step_item.get("selector")
         or _extract_override_selector(step_item, platform)
         or _extract_override_selector(step_item, "android")
+        or _extract_override_selector(step_item, "ios")
         or option_image_path
         or value
     )
@@ -801,6 +807,7 @@ def prepare_steps_for_platform(
         first_selector = _first_locator_selector(locator_candidates)
 
         if platform_lower in execute_on and action in {"click_image", "assert_image"}:
+            step_item = preserve_image_references(step_item, args)
             image_path = _resolve_image_path(
                 step_item=step_item,
                 args=args,

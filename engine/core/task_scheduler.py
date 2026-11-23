@@ -217,48 +217,53 @@ def execute_task(task: Dict[str, Any], auth_headers: Dict[str, str]) -> List[Dic
 
     # T4：本机 adb 清单过滤——不在本机的设备直接跳过（debug 日志，不建 run）。
     local = local_device_serials()
-    bridge = CloudBridge(auth_headers=auth_headers)
-    run_name = f"定时任务: {task_name}"
-    started: List[Dict[str, Any]] = []
-    for serial in serials:
-        if not _is_device_on_this_machine(serial, local):
-            logger.debug(
-                "[定时任务] 任务 #%s 设备 %s 不在本机 adb 清单，跳过（不建 run）", task_id, serial
-            )
-            continue
+    with CloudBridge(auth_headers=auth_headers) as bridge:
+        run_name = f"定时任务: {task_name}"
+        started: List[Dict[str, Any]] = []
+        eligible_serials = [serial for serial in serials if _is_device_on_this_machine(serial, local)]
+        if not eligible_serials:
+            return started
         try:
-            precheck = scenario_service.precheck_scenario_for_device(
-                bridge, int(scenario_id), serial, env_id
-            )
+            execution_data = bridge.fetch_scenario_execution_data(int(scenario_id), env_id)
         except Exception as exc:
-            logger.warning("[定时任务] 任务 #%s 设备 %s 预检异常（跳过）: %s", task_id, serial, exc)
-            continue
-        if not precheck.get("ok"):
-            reason = scenario_service.summarize_precheck_failure(precheck)
-            logger.warning(
-                "[定时任务] 任务 #%s 设备 %s 预检未通过（跳过）: %s", task_id, serial, reason
+            logger.warning("[定时任务] 任务 #%s 拉取执行数据失败（跳过）: %s", task_id, exc)
+            return started
+        for serial in eligible_serials:
+            try:
+                precheck = scenario_service.precheck_scenario_for_device(
+                    bridge, int(scenario_id), serial, env_id, execution_data=execution_data
+                )
+            except Exception as exc:
+                logger.warning("[定时任务] 任务 #%s 设备 %s 预检异常（跳过）: %s", task_id, serial, exc)
+                continue
+            if not precheck.get("ok"):
+                reason = scenario_service.summarize_precheck_failure(precheck)
+                logger.warning(
+                    "[定时任务] 任务 #%s 设备 %s 预检未通过（跳过）: %s", task_id, serial, reason
+                )
+                continue
+            run_id = str(uuid.uuid4())
+            batch_id = str(uuid.uuid4())
+            scenario_service.start_background_scenario_run(
+                scenario_id=int(scenario_id),
+                env_id=env_id,
+                device_serial=serial,
+                run_id=run_id,
+                batch_id=batch_id,
+                auth_headers=bridge.auth_headers,
+                upstream=bridge.upstream,
+                execution_data=execution_data,
+                notify=notify,
+                run_name=run_name,
             )
-            continue
-        run_id = str(uuid.uuid4())
-        batch_id = str(uuid.uuid4())
-        scenario_service.start_background_scenario_run(
-            scenario_id=int(scenario_id),
-            env_id=env_id,
-            device_serial=serial,
-            run_id=run_id,
-            batch_id=batch_id,
-            auth_headers=auth_headers,
-            notify=notify,
-            run_name=run_name,
-        )
-        started.append({"device_serial": serial, "run_id": run_id, "batch_id": batch_id})
-        logger.info(
-            "[定时任务] 任务 #%s 本地触发: scenario=%s device=%s run=%s",
-            task_id,
-            scenario_id,
-            serial,
-            run_id,
-        )
+            started.append({"device_serial": serial, "run_id": run_id, "batch_id": batch_id})
+            logger.info(
+                "[定时任务] 任务 #%s 本地触发: scenario=%s device=%s run=%s",
+                task_id,
+                scenario_id,
+                serial,
+                run_id,
+            )
     return started
 
 
@@ -402,9 +407,9 @@ class LocalTaskScheduler:
         if not token or not upstream:
             return {"scheduled": len(self.scheduled_task_ids()), "added": 0,
                     "updated": 0, "removed": 0, "skipped": 0, "refreshed": 0}
-        bridge = CloudBridge(auth_headers={"Authorization": f"Bearer {token}"})
         try:
-            items = bridge.fetch_client_tasks()
+            with CloudBridge(upstream=upstream, auth_headers={"Authorization": f"Bearer {token}"}) as bridge:
+                items = bridge.fetch_client_tasks()
         except Exception as exc:
             logger.warning("[定时任务] 拉取 /api/client-tasks 失败（保留现有调度）: %s", exc)
             return {"scheduled": len(self.scheduled_task_ids()), "added": 0,

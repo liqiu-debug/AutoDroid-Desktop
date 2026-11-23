@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from engine import config_store, presence
-from engine.app import create_app
+from safe_lifespan import create_test_app as create_app
 from engine.core import runner_service
 
 
@@ -82,6 +82,21 @@ class _MockCloud:
                     {"method": "GET", "path": self.path,
                      "headers": {k.lower(): v for k, v in self.headers.items()}}
                 )
+                if "/execution-data" in self.path:
+                    from urllib.parse import urlparse
+
+                    path = urlparse(self.path).path
+                    if path.startswith("/api/cases/"):
+                        case_id = int(path.split("/")[3])
+                        self._send(200, {
+                            "schema_version": 1, "case": {"id": case_id, "name": "登录用例", "variables": [], "steps": []},
+                            "standard_steps": [{"order": 1, "action": "click", "args": {},
+                                "platform_overrides": {"android": {"selector": "确定", "by": "text"}},
+                                "execute_on": ["android"], "timeout": 10, "error_strategy": "ABORT",
+                                "description": "点确定", "retry_count": 0}],
+                            "env_variables": {"ENV_K": "v"}, "app_key_mapping": {},
+                        })
+                        return
                 if self.path.startswith("/api/cases/") and self.path.endswith("/steps"):
                     self._send(200, [
                         {"order": 1, "action": "click", "args": {},
@@ -150,6 +165,16 @@ def _png_b64() -> str:
     buffer = io.BytesIO()
     Image.new("RGB", (20, 20), color=(1, 2, 3)).save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def test_client_info_declares_execution_protocol_and_stable_engine_instance(client):
+    first = client.get("/api/client/info").json()
+    second = client.get("/api/client/info").json()
+    assert first["clientMode"] is True
+    assert first["execution_preflight_v1"] is True
+    assert first["launch_idempotency"] is True
+    assert first["engine_instance_id"]
+    assert first["engine_instance_id"] == second["engine_instance_id"]
 
 
 def test_crop_template_uploads_and_caches(client, mock_cloud, tmp_path):
@@ -279,7 +304,7 @@ def test_run_batch_intercepts_and_returns_expected_shape(client, monkeypatch):
     monkeypatch.setattr(
         runner_service,
         "precheck_for_device",
-        lambda bridge, case_id, serial, env_id=None: {"ok": True, "platform": "android"},
+        lambda bridge, case_id, serial, env_id=None, execution_data=None: {"ok": True, "platform": "android"},
     )
     monkeypatch.setattr(
         runner_service, "start_background_case_run", lambda **kwargs: started.append(kwargs)
@@ -303,7 +328,7 @@ def test_run_batch_all_precheck_failed_returns_400(client, monkeypatch):
     monkeypatch.setattr(
         runner_service,
         "precheck_for_device",
-        lambda bridge, case_id, serial, env_id=None: {"ok": False, "step_checks": []},
+        lambda bridge, case_id, serial, env_id=None, execution_data=None: {"ok": False, "step_checks": []},
     )
     resp = client.post("/api/cases/5/run-batch", json={"device_serials": ["USB1"]})
     assert resp.status_code == 400

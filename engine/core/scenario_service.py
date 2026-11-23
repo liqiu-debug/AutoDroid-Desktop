@@ -22,6 +22,7 @@ import logging
 import threading
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -154,13 +155,15 @@ def precheck_scenario_for_device(
     scenario_id: int,
     device_serial: str,
     env_id: Optional[int] = None,
+    execution_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """场景本地预检：逐 case 预检 + 变量链（对齐 scenarios.precheck_scenario_execution）。"""
-    scenario = bridge.fetch_scenario(scenario_id)
-    steps = bridge.fetch_scenario_steps(scenario_id)
+    data = deepcopy(execution_data if execution_data is not None else bridge.fetch_scenario_execution_data(scenario_id, env_id))
+    scenario = data["scenario"]
+    steps = data["scenario_steps"]
 
-    scenario_context: Dict[str, str] = dict(bridge.fetch_env_variables(env_id) or {})
-    mapping = bridge.fetch_app_key_mapping()
+    scenario_context: Dict[str, str] = dict(data["env_variables"] or {})
+    mapping = data["app_key_mapping"]
 
     case_checks: List[Dict[str, Any]] = []
     has_runnable_cases = False
@@ -171,12 +174,9 @@ def precheck_scenario_for_device(
 
     for scenario_step in steps:
         case_id = scenario_step.get("case_id")
-        try:
-            case = bridge.fetch_case(case_id)
-            step_rows = bridge.fetch_case_steps(case_id)
-        except Exception:
-            case = None
-            step_rows = []
+        entry = data["cases"].get(str(case_id)) or {}
+        case = entry.get("case")
+        step_rows = entry.get("standard_steps") or []
         if not case:
             fail_cases += 1
             case_checks.append(
@@ -343,6 +343,7 @@ async def run_scenario_local(
     abort_event: Optional[threading.Event] = None,
     preset_run_key: Optional[Any] = None,
     run_name: Optional[str] = None,
+    execution_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """本地执行场景（单设备）：逐 case 执行 + kind=scenario 上报 + WS 消息。
 
@@ -351,7 +352,7 @@ async def run_scenario_local(
     """
     run_id = run_id or str(uuid.uuid4())
     batch_id = batch_id or str(uuid.uuid4())
-    record = run_registry.registry.register(
+    record = run_registry.registry.get(run_id) or run_registry.registry.register(
         LocalRunRecord(
             kind="scenario",
             target_id=int(scenario_id),
@@ -386,10 +387,15 @@ async def run_scenario_local(
 
     try:
         try:
-            scenario = await _blocking(bridge.fetch_scenario, scenario_id)
-            scenario_steps = await _blocking(bridge.fetch_scenario_steps, scenario_id)
-            env_variables = await _blocking(bridge.fetch_env_variables, env_id)
-            mapping = await _blocking(bridge.fetch_app_key_mapping)
+            data = deepcopy(execution_data) if execution_data is not None else await _blocking(
+                bridge.fetch_scenario_execution_data, scenario_id, env_id
+            )
+            if execution_data is None:
+                data = deepcopy(data)
+            scenario = data["scenario"]
+            scenario_steps = data["scenario_steps"]
+            env_variables = data["env_variables"]
+            mapping = data["app_key_mapping"]
         except Exception as exc:
             message = f"拉取场景数据失败: {exc}"
             await emit_log(emit, "error", f"❌ {message}")
@@ -423,6 +429,7 @@ async def run_scenario_local(
             execution_id = preset_run_key if isinstance(preset_run_key, int) else None
             # S1：批量预创建的 execution_id 回填本地登记（供 /api/runs/active + 前端 terminate）
             run_registry.registry.update_execution_id(run_id, preset_run_key)
+            record.metadata["cloud_record_pending"] = False
         else:
             await _blocking(context.create_cloud_run, run_name or scenario_name, platform)
             execution_id = context.run_key if isinstance(context.run_key, int) else None
@@ -434,6 +441,7 @@ async def run_scenario_local(
                 "type": "run_start",
                 "status": "RUNNING",
                 "scenario_id": int(scenario_id),
+                "run_id": run_id,
                 "execution_id": execution_id,
                 "batch_id": batch_id,
                 "device_serial": device_serial,
@@ -454,23 +462,13 @@ async def run_scenario_local(
 
             alias = scenario_step.get("alias") or f"Step {index + 1}"
             case_id = scenario_step.get("case_id")
-            fetch_error: Optional[str] = None
-            try:
-                case = await _blocking(bridge.fetch_case, case_id)
-                step_rows = await _blocking(bridge.fetch_case_steps, case_id)
-            except Exception as exc:
-                case = None
-                step_rows = []
-                fetch_error = str(exc)
-                logger.warning("场景步骤取用例失败: scenario=%s case=%s error=%s", scenario_id, case_id, exc)
+            entry = data["cases"].get(str(case_id)) or {}
+            case = deepcopy(entry.get("case"))
+            step_rows = deepcopy(entry.get("standard_steps") or [])
 
             if not case:
-                # S3：缺失用例 / 取用例瞬时失败记失败后 continue（对齐平台
-                # scenario_execution.py 缺失用例 continue 语义），不再 break 终止整场。
-                if fetch_error and "404" not in fetch_error:
-                    reason = f"拉取用例失败 (ID: {case_id}): {fetch_error}，跳过继续"
-                else:
-                    reason = f"用例不存在 (ID: {case_id})，跳过"
+                # 聚合数据区分缺失引用和整个请求失败；缺失引用仍按平台语义继续。
+                reason = f"用例不存在 (ID: {case_id})，跳过"
                 await emit_log(emit, "warning", f"⚠️ 步骤 {index + 1} ({alias}): {reason}")
                 await emit_case_outcome(emit, "failed", 0.0)
                 case_statuses.append("failed")
@@ -652,36 +650,56 @@ def start_background_scenario_run(
     preset_run_key: Optional[Any] = None,
     notify: bool = False,
     run_name: Optional[str] = None,
+    execution_data: Optional[Dict[str, Any]] = None,
+    upstream: Optional[str] = None,
 ) -> None:
     """POST /api/scenarios/{id}/run 的后台执行：线程内驱动（无 WS 订阅者，仅 registry 轮询）。"""
+    from engine import config_store
+
+    task_upstream = upstream if upstream is not None else config_store.get_upstream() or ""
+    task_headers = dict(auth_headers)
+    task_data = deepcopy(execution_data)
+    record = run_registry.registry.register(LocalRunRecord(
+        kind="scenario", target_id=scenario_id, run_id=run_id, batch_id=batch_id, device_serial=device_serial,
+        execution_id=preset_run_key if isinstance(preset_run_key, int) else None,
+        metadata={"cloud_record_pending": preset_run_key is None},
+    ))
 
     def _thread_main() -> None:
         async def _emit(message: Dict[str, Any]) -> None:
             return None
 
         async def _run() -> None:
-            bridge = CloudBridge(auth_headers=auth_headers)
-            await run_scenario_local(
-                scenario_id=scenario_id,
-                env_id=env_id,
-                device_serial=device_serial,
-                run_id=run_id,
-                batch_id=batch_id,
-                emit=_emit,
-                bridge=bridge,
-                notify=notify,
-                preset_run_key=preset_run_key,
-                run_name=run_name,
-            )
+            with CloudBridge(upstream=task_upstream, auth_headers=task_headers) as bridge:
+                await run_scenario_local(
+                    scenario_id=scenario_id,
+                    env_id=env_id,
+                    device_serial=device_serial,
+                    run_id=run_id,
+                    batch_id=batch_id,
+                    emit=_emit,
+                    bridge=bridge,
+                    notify=notify,
+                    preset_run_key=preset_run_key,
+                    run_name=run_name,
+                    execution_data=task_data,
+                    abort_event=record.abort_event,
+                )
 
         try:
             asyncio.run(_run())
         except Exception:
             logger.exception("场景本地执行线程异常: scenario=%s device=%s", scenario_id, device_serial)
+        finally:
+            run_registry.registry.complete(run_id)
 
-    threading.Thread(
-        target=_thread_main, name=f"local-scenario-{scenario_id}-{device_serial}", daemon=True
-    ).start()
+    try:
+        threading.Thread(
+            target=_thread_main, name=f"local-scenario-{scenario_id}-{device_serial}", daemon=True
+        ).start()
+    except BaseException:
+        run_registry.registry.complete(run_id)
+        raise
 
 
 async def run_scenario_via_websocket(
@@ -690,8 +708,14 @@ async def run_scenario_via_websocket(
     env_id: Optional[int],
     device_serial: Optional[str],
     auth_headers: Dict[str, str],
+    execution_data: Optional[Dict[str, Any]] = None,
+    upstream: Optional[str] = None,
 ) -> None:
     """WS /api/scenarios/ws/run/{scenario_id}：连接即执行（协议对齐 scenarios.websocket_run_scenario）。"""
+    from engine import config_store
+
+    task_upstream = upstream if upstream is not None else config_store.get_upstream() or ""
+    task_headers = dict(auth_headers)
     await websocket.accept()
 
     async def _emit(message: Dict[str, Any]) -> None:
@@ -700,6 +724,7 @@ async def run_scenario_via_websocket(
         except Exception:
             logger.warning("场景 WS 推送失败: scenario=%s", scenario_id, exc_info=True)
 
+    bridge: Optional[CloudBridge] = None
     try:
         if not device_serial:
             await emit_log(_emit, "error", "❌ 请选择执行设备")
@@ -714,12 +739,15 @@ async def run_scenario_via_websocket(
                 }
             )
             return
-        bridge = CloudBridge(auth_headers=auth_headers)
+        bridge = CloudBridge(upstream=task_upstream, auth_headers=task_headers)
         # S5：服务端预检分支（对齐 scenarios.websocket_run_scenario）——
         # 预检失败只发 log + run_complete{status:ERROR}，不进执行体。
         try:
+            data = deepcopy(execution_data) if execution_data is not None else await asyncio.to_thread(
+                bridge.fetch_scenario_execution_data, scenario_id, env_id
+            )
             precheck = await asyncio.to_thread(
-                precheck_scenario_for_device, bridge, scenario_id, device_serial, env_id
+                precheck_scenario_for_device, bridge, scenario_id, device_serial, env_id, execution_data=data
             )
         except Exception as exc:
             message = f"运行前预检异常: {exc}"
@@ -756,11 +784,14 @@ async def run_scenario_via_websocket(
             device_serial=device_serial,
             emit=_emit,
             bridge=bridge,
+            execution_data=data,
         )
     except Exception as exc:
         logger.exception("场景 WS 执行失败: scenario=%s", scenario_id)
         await emit_log(_emit, "error", f"❌ 系统异常: {exc}")
     finally:
+        if bridge is not None:
+            bridge.close()
         try:
             await websocket.close()
         except Exception:

@@ -711,7 +711,7 @@ def mock_cloud():
 def client(tmp_path, monkeypatch, mock_cloud):
     from fastapi.testclient import TestClient
 
-    from engine.app import create_app
+    from safe_lifespan import create_test_app as create_app
 
     monkeypatch.setenv("AUTODROID_USER_DATA", str(tmp_path / "userdata"))
     monkeypatch.delenv("AUTODROID_FRONTEND_DIST", raising=False)

@@ -37,6 +37,13 @@ class FakeBridge:
     def fetch_app_key_mapping(self):
         return {}
 
+    def fetch_case_execution_data(self, case_id, env_id=None):
+        return {
+            "schema_version": 1, "case": self.fetch_case(case_id),
+            "standard_steps": self.fetch_case_steps(case_id),
+            "env_variables": self.fetch_env_variables(env_id), "app_key_mapping": {},
+        }
+
     def ensure_template_local(self, path):
         return f"/cache/{path.rsplit('/', 1)[-1]}"
 
@@ -411,7 +418,7 @@ def test_padding_records_do_not_execute_their_steps(fake_runner):
     )
     result, _, _ = _run(bridge=bridge, abort_event=abort_event)
 
-    assert FakeRunner.instances[0].run_steps == [], "补齐记录不得真正执行步骤"
+    assert FakeRunner.instances == [], "执行前已取消时不应连接设备或执行步骤"
     _, steps_payload = bridge.step_payloads[0]
     assert [s["status"] for s in steps_payload["steps"]] == ["SKIP", "SKIP"]
     assert all(s["output"]["skip_reason"] == "用户中止执行" for s in steps_payload["steps"])

@@ -363,9 +363,14 @@ def test_scheduled_task_keeps_wired_iphone_only_when_on_this_machine(monkeypatch
 
     started = []
     monkeypatch.setattr(
+        task_scheduler.CloudBridge,
+        "fetch_scenario_execution_data",
+        lambda self, scenario_id, env_id=None: {},
+    )
+    monkeypatch.setattr(
         scenario_service,
         "precheck_scenario_for_device",
-        lambda bridge, scenario_id, serial, env_id=None: {"ok": True, "cases": []},
+        lambda bridge, scenario_id, serial, env_id=None, execution_data=None: {"ok": True, "cases": []},
     )
     monkeypatch.setattr(scenario_service, "start_background_scenario_run", lambda **kwargs: started.append(kwargs))
     task = {"id": 1, "name": "t", "task_type": "UI", "scenario_id": 3, "device_serials": [UDID, "OTHER-UDID"],

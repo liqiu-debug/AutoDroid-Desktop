@@ -36,6 +36,7 @@ from engine.core.utils.image_match_options import select_image_options
 from engine.core.step_contract import (
     MAX_RETRY_COUNT,
     step_image_options,
+    step_image_match,
     normalize_action,
     normalize_error_strategy,
     normalize_execute_on,
@@ -804,7 +805,11 @@ class TestCaseRunner:
                 )
             try:
                 image_options = step_image_options(step_data, args)
-                config = select_image_options(image_options, self.platform) if image_options is not None else None
+                config = select_image_options(
+                    image_options, self.platform, image_path=path,
+                    platform_overrides=_render_runtime_value(step_data.get("platform_overrides"), self.runtime_variables),
+                    default_image_path=args.get("image_path") or args.get("path") or _render_runtime_value(step_data.get("selector"), self.runtime_variables),
+                ) if image_options is not None else None
             except ValueError as exc:
                 raise ValueError(_with_error_code("P1006_INVALID_ARGS", str(exc))) from exc
             parameters = inspect.signature(self.driver.click_image).parameters
@@ -812,6 +817,11 @@ class TestCaseRunner:
             def supports(name):
                 return name in parameters or accepts_kwargs
             kwargs = {}
+            shared_match = step_image_match(step_data, args)
+            if supports("image_match"):
+                kwargs["image_match"] = shared_match
+            elif shared_match["profile"] != "strict-v1":
+                raise NotImplementedError(_with_error_code("P1002_ACTION_NOT_SUPPORTED", "当前图像驱动不支持单模板多设备匹配，请升级执行端"))
             if config is not None:
                 if not supports("image_options"):
                     raise NotImplementedError(_with_error_code("P1002_ACTION_NOT_SUPPORTED", "当前图像驱动不支持模板配置"))
@@ -863,12 +873,21 @@ class TestCaseRunner:
                 )
             try:
                 image_options = step_image_options(step_data, args)
-                config = select_image_options(image_options, self.platform) if image_options is not None else None
+                config = select_image_options(
+                    image_options, self.platform, image_path=path,
+                    platform_overrides=_render_runtime_value(step_data.get("platform_overrides"), self.runtime_variables),
+                    default_image_path=args.get("image_path") or args.get("path") or _render_runtime_value(step_data.get("selector"), self.runtime_variables),
+                ) if image_options is not None else None
             except ValueError as exc:
                 raise ValueError(_with_error_code("P1006_INVALID_ARGS", str(exc))) from exc
             parameters = inspect.signature(self.driver.assert_image).parameters
             accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
             kwargs = {"match_mode": match_mode}
+            shared_match = step_image_match(step_data, args)
+            if "image_match" in parameters or accepts_kwargs:
+                kwargs["image_match"] = shared_match
+            elif shared_match["profile"] != "strict-v1":
+                raise NotImplementedError(_with_error_code("P1002_ACTION_NOT_SUPPORTED", "当前图像驱动不支持单模板多设备匹配，请升级执行端"))
             if config is not None:
                 if "image_options" not in parameters and not accepts_kwargs:
                     raise NotImplementedError(_with_error_code("P1002_ACTION_NOT_SUPPORTED", "当前图像断言驱动不支持模板配置"))
@@ -1186,7 +1205,7 @@ def _render_runtime_value(value: Any, variables: Dict[str, str]) -> Any:
     if isinstance(value, list):
         return [_render_runtime_value(item, variables) for item in value]
     if isinstance(value, dict):
-        return {k: _render_runtime_value(v, variables) for k, v in value.items()}
+        return {k: v if k == "image_match" else _render_runtime_value(v, variables) for k, v in value.items()}
     return value
 
 
@@ -1253,6 +1272,7 @@ def _resolve_image_path(
         or step_data.get("selector")
         or _extract_override_selector(step_data, platform)
         or _extract_override_selector(step_data, "android")
+        or _extract_override_selector(step_data, "ios")
         or option_image_path
         or value
     )

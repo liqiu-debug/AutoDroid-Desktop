@@ -37,6 +37,8 @@ from engine.core.step_contract import (
     standard_step_to_legacy,
 )
 from engine.core.utils import calculate_element_from_coordinates
+from engine.core.utils.image_match_options import preserve_image_references
+from engine.core.utils.android_png import capture_android_png
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +48,6 @@ CLICK_TARGET_NOT_FOUND_DETAIL = "添加步骤失败：当前点击区域未识�
 # Android u2 连接缓存空闲回收时间；u2 Device 本身无长连接资源，仅避免无限膨胀
 RECORDING_ANDROID_IDLE_TTL_SECONDS = 300.0
 
-# dump 截图统一编码为 JPEG 的质量（与上游一致：模板裁剪素材源，不缩放）
-RECORDING_SCREENSHOT_JPEG_QUALITY = 90
 NETWORK_DEVICE_SERIAL_RE = re.compile(r"^[\w.\-]+:\d+$")
 
 # 大 JSON 响应 gzip 阈值（与上游一致）
@@ -111,38 +111,28 @@ def _image_bytes_format(raw: bytes) -> str:
     return "png"
 
 
-def _ios_png_to_jpeg(raw: bytes) -> bytes:
-    """iOS 截图是整屏 PNG（约 3MB）：同尺寸转 JPEG，dump 响应小一个量级。
-
-    像素尺寸不能变：点击坐标与模板裁剪都按截图像素计算。
-    """
-    from PIL import Image as _Image
-
-    buffered = io.BytesIO()
-    _Image.open(io.BytesIO(raw)).convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
-    return buffered.getvalue()
-
-
 def _take_screenshot_payload(device, serial: Optional[str] = None, platform: Optional[str] = None) -> Tuple[str, str]:
-    """截取设备屏幕，返回 (base64, 图像格式)。语义同上游 recording.py。"""
+    """返回原尺寸无损截图，供模板裁剪及定位验证使用。
+
+    WDA 的原始 PNG 字节直接透传，PIL 图像编码为 PNG；设备展示预览
+    使用独立链路，不能把预览的 JPEG 压缩噪点带入录制模板。
+    """
     started_at = time.monotonic()
     try:
-        image = device.screenshot()
+        image = capture_android_png(device) if platform == "android" or getattr(type(device), "adb_device", None) is not None else device.screenshot()
         if isinstance(image, (bytes, bytearray)):
             raw = bytes(image)
-            if platform == "ios":
-                raw = _ios_png_to_jpeg(raw)
             device_transport_metrics.record(
                 str(serial or ""), "recording_screenshot", time.monotonic() - started_at, byte_count=len(raw)
             )
             return base64.b64encode(raw).decode("utf-8"), _image_bytes_format(raw)
         buffered = io.BytesIO()
-        image.convert("RGB").save(buffered, format="JPEG", quality=RECORDING_SCREENSHOT_JPEG_QUALITY)
+        image.convert("RGB").save(buffered, format="PNG", compress_level=1)
         raw = buffered.getvalue()
         device_transport_metrics.record(
             str(serial or ""), "recording_screenshot", time.monotonic() - started_at, byte_count=len(raw)
         )
-        return base64.b64encode(raw).decode("utf-8"), "jpeg"
+        return base64.b64encode(raw).decode("utf-8"), "png"
     except Exception:
         device_transport_metrics.record(
             str(serial or ""), "recording_screenshot", time.monotonic() - started_at, success=False
@@ -701,6 +691,7 @@ def localize_step_images(step: Dict[str, Any], ensure_local, platform: str = "an
     if step_item.get("execute_on") and platform not in normalize_execute_on(step_item["execute_on"]):
         return step_item
     args = dict(step_item.get("args") or {})
+    step_item = preserve_image_references(step_item, args)
     # Use the runner's precedence: the active platform image overrides args.
     # Localizing only args leaves that override pointing into the frozen app.
     target = _resolve_image_path(step_item, args, resolve_locator_candidates(step_item, platform=platform),
@@ -708,18 +699,32 @@ def localize_step_images(step: Dict[str, Any], ensure_local, platform: str = "an
     if not target:
         return step_item
     text = str(target).strip()
-    if text.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", text):
-        return step_item
     try:
-        local_path = ensure_local(text)
+        local_path = text if text.startswith("/") or re.match(r"^[A-Za-z]:[\\/]", text) else ensure_local(text)
     except Exception as exc:
         raise RecordingError(f"图像模板下载或缓存读取失败，请重新截取或重试：{text}", status_code=502) from exc
     args["image_path"] = local_path
+    from pathlib import Path
+    from engine.core.step_contract import step_image_match, step_image_options
+    from engine.core.utils.image_match_options import select_image_options
+    from engine.core.utils.adaptive_template import ensure_descriptor
+    settings = select_image_options(step_image_options(step_item, args), platform,
+        image_path=text, platform_overrides=step_item.get("platform_overrides"),
+        default_image_path=args.get("image_path") or text)
+    args["image_match"] = ensure_descriptor(Path(local_path).read_bytes(), step_image_match(step_item, args),
+        anchor=settings.get("tap_anchor"), deadline=time.monotonic() + 10)
+    if isinstance(step_item.get("options"), dict) and "image_match" in step_item["options"]:
+        step_item["options"] = {**step_item["options"], "image_match": args["image_match"]}
     step_item["args"] = args
     overrides = dict(step_item.get("platform_overrides") or {})
-    current = overrides.get(platform)
-    if isinstance(current, dict) and str(current.get("by") or "").lower() == "image":
-        overrides[platform] = {**current, "selector": local_path}
+    # A single-platform recording may lend its template to the other platform.
+    # Keep equivalent references aligned so metadata selection sees the same
+    # template after localization; do not rewrite independent platform images.
+    for key, current in list(overrides.items()):
+        if (isinstance(current, dict) and str(current.get("by") or "").lower() == "image"
+                and str(current.get("selector") or "").strip() == text):
+            overrides[key] = {**current, "selector": local_path}
+    if overrides:
         step_item["platform_overrides"] = overrides
     return step_item
 

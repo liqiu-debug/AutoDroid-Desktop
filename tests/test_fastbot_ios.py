@@ -335,6 +335,7 @@ def test_start_fastbot_run_accepts_ios(monkeypatch):
 
     class B:
         auth_headers = {}
+        upstream = "https://platform.test"
 
     fastbot_service.start_fastbot_run(B(), {"device_serial": SERIAL, "package_name": "com.demo.app"})
     assert captured["device_serial"] == SERIAL
@@ -437,6 +438,7 @@ def test_busy_device_rejects_second_run_and_is_released(monkeypatch):
 
     class B:
         auth_headers = {}
+        upstream = "https://platform.test"
 
     fastbot_service.start_fastbot_run(B(), {"device_serial": SERIAL, "package_name": "com.demo.app"})
     assert device_busy.is_busy(SERIAL)
@@ -461,6 +463,7 @@ def test_zero_percent_weights_stay_zero(monkeypatch):
 
     class B:
         auth_headers = {}
+        upstream = "https://platform.test"
 
     from engine.core import device_busy
     device_busy.reset_for_tests()
