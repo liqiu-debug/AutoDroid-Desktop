@@ -19,6 +19,7 @@ step "1/4 内置 platform-tools（darwin）"
 bash scripts/fetch-platform-tools.sh darwin
 
 step "2/4 本地引擎（release-engine）"
+python3 scripts/fetch-trace-processor.py
 if [ -f release-engine/autodroid-engine/autodroid-engine ] || [ -f release-engine/autodroid-engine ]; then
   echo "引擎已存在（跳过 PyInstaller；删除 release-engine/ 可强制重建）"
 else

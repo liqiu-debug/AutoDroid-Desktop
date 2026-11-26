@@ -12,6 +12,9 @@
 - 运行时数据（模板缓存等）走 AUTODROID_USER_DATA（Electron userData）。
 """
 from pathlib import Path
+import platform
+import runpy
+import sys
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
@@ -33,10 +36,28 @@ for resource in (
 # frozen 态若不带 datas 会报「Resource assets/u2.jar not found in uiautomator2 package」。
 datas = collect_data_files("uiautomator2") + collect_data_files("findit") + collect_data_files("rapidocr")
 
+# Fixed, checksummed Trace Processor is part of the frozen runtime. Downloads
+# happen explicitly in build preparation; a missing/wrong artifact stops here.
+trace_platform = ("windows-x64" if sys.platform == "win32" else
+                  "mac-arm64" if platform.machine().lower() in {"arm64", "aarch64"} else "mac-x64")
+trace_name = "trace_processor_shell.exe" if sys.platform == "win32" else "trace_processor_shell"
+trace_root = Path(SPECPATH) / "assets" / "trace_processor" / trace_platform
+trace_manifest = Path(SPECPATH) / "scripts" / "trace-processor-manifest.json"
+trace_fetch = runpy.run_path(str(Path(SPECPATH) / "scripts" / "fetch-trace-processor.py"))
+if trace_fetch["main"](["--platform", trace_platform, "--verify-only"]) != 0:
+    raise RuntimeError("Trace Processor 校验失败，不能继续构建")
+datas += [(str(trace_root / trace_name), f"trace_processor/{trace_platform}"),
+          (str(trace_manifest), "trace_processor"),
+          (str(Path(SPECPATH) / "scripts" / "trace-processor-LICENSE.txt"), "trace_processor")]
+
 # iOS 驱动（facebook-wda）：引擎里 IOSDriver 是可选导入（缺包只剩 Android），漏打不会构建失败，
 # 只会在运行时报「iOS 驱动不可用」——必须显式收集。
 
-hiddenimports = ["onnxruntime", "rapidocr.inference_engine.onnxruntime"]
+hiddenimports = ["onnxruntime", "rapidocr.inference_engine.onnxruntime",
+                 "engine.core.startup.contract", "engine.core.startup.runner",
+                 "engine.core.startup.android", "engine.core.startup.ios",
+                 "engine.core.startup_service", "engine.core.startup_selfcheck",
+                 "engine.core.startup_trace_analysis"]
 for package in (
     "uvicorn",
     "apscheduler",
@@ -67,6 +88,15 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
+# Analysis auto-detects Mach-O/PE files even when supplied as data. Keep the
+# already verified official standalone tool byte-for-byte: PyInstaller's
+# install-name rewriting/ad-hoc signing would invalidate its pinned SHA256.
+trace_destination = f"trace_processor/{trace_platform}/{trace_name}"
+trace_collected = [item for item in a.binaries if item[0].replace("\\", "/") == trace_destination]
+a.binaries = [item for item in a.binaries if item not in trace_collected]
+a.datas = [item for item in a.datas if item[0].replace("\\", "/") != trace_destination]
+a.datas.append((trace_destination, str(trace_root / trace_name), "DATA"))
 
 pyz = PYZ(a.pure)
 

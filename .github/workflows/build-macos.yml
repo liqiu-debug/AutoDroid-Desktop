@@ -74,11 +74,13 @@ jobs:
           test "v$(node -p 'require("./package.json").version')" = "$RELEASE_TAG"
           python -m venv .venv
           .venv/bin/python -m pip install -r requirements.txt pytest pyinstaller
+          .venv/bin/python scripts/fetch-trace-processor.py --platform "mac-$TARGET_ARCH"
           .venv/bin/python -m pytest tests/test_desktop_ocr.py tests/test_ocr_retry_contract.py tests/test_image_click_contract.py tests/test_image_match_preview_api.py -q
           npm ci
           npm run check
           npm run dist:engine
           release-engine/autodroid-engine/autodroid-engine --check-ocr
+          release-engine/autodroid-engine/autodroid-engine --check-startup
           test "$(lipo -archs release-engine/autodroid-engine/autodroid-engine)" = "$NATIVE_ARCH"
           bash scripts/fetch-platform-tools.sh darwin
           bash scripts/check-dist-prereqs.sh darwin
@@ -89,8 +91,14 @@ jobs:
           npx electron-builder --dir --mac --"$TARGET_ARCH" --publish never --config.mac.identity=null
           app="release/$APP_DIR/AutoDroid.app"
           codesign --force --deep --sign - --timestamp=none "$app"
+          # Preserve the official standalone tool's pinned bytes. --deep above
+          # rewrites its existing linker signature; restore it and reseal the
+          # outer app without recursively signing the tool a second time.
+          cp "assets/trace_processor/mac-$TARGET_ARCH/trace_processor_shell" "$app/Contents/Resources/engine-bin/autodroid-engine/_internal/trace_processor/mac-$TARGET_ARCH/trace_processor_shell"
+          codesign --force --sign - --timestamp=none "$app"
           codesign --verify --deep --strict "$app"
           "$app/Contents/Resources/engine-bin/autodroid-engine/autodroid-engine" --check-ocr
+          "$app/Contents/Resources/engine-bin/autodroid-engine/autodroid-engine" --check-startup
           npx electron-builder --prepackaged "$app" --mac dmg zip --"$TARGET_ARCH" --publish never --config.mac.identity=null
           for archive in release/*.zip; do unzip -tq "$archive"; done
           mount_dir="$(mktemp -d)"
@@ -99,6 +107,7 @@ jobs:
             trap 'hdiutil detach "$mount_dir" || true' EXIT
             codesign --verify --deep --strict "$mount_dir/AutoDroid.app"
             "$mount_dir/AutoDroid.app/Contents/Resources/engine-bin/autodroid-engine/autodroid-engine" --check-ocr
+            "$mount_dir/AutoDroid.app/Contents/Resources/engine-bin/autodroid-engine/autodroid-engine" --check-startup
             hdiutil detach "$mount_dir"
             trap - EXIT
           done

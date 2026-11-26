@@ -91,7 +91,20 @@ class LocalRunRegistry:
         self._runs: Dict[str, LocalRunRecord] = {}
 
     def register(self, record: LocalRunRecord) -> LocalRunRecord:
+        from engine.core import device_busy
+
         with self._lock:
+            existing = self._runs.get(record.run_id)
+            if existing is not None:
+                if (existing.device_serial, existing.kind, existing.target_id) != (
+                    record.device_serial, record.kind, record.target_id
+                ):
+                    raise ValueError("运行编号已绑定其他任务")
+                return existing
+            if record.device_serial and not device_busy.try_acquire(
+                record.device_serial, record.kind, owner=record.run_id
+            ):
+                raise ValueError("该设备正在执行任务，请等执行结束后再试")
             self._runs[record.run_id] = record
         return record
 
@@ -223,10 +236,20 @@ class LocalRunRegistry:
             if status:
                 record.status = str(status).upper()
             record.done_event.set()
+            if record.device_serial:
+                from engine.core import device_busy
+
+                device_busy.release(record.device_serial, record.kind, owner=record.run_id)
 
     def reset_for_tests(self) -> None:
         with self._lock:
+            records = list(self._runs.values())
             self._runs.clear()
+        from engine.core import device_busy
+
+        for record in records:
+            if record.device_serial:
+                device_busy.release(record.device_serial, record.kind, owner=record.run_id)
 
 
 registry = LocalRunRegistry()

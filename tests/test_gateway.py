@@ -709,6 +709,7 @@ def test_devices_list_overlays_local_presence_and_heals_cloud(client, mock_upstr
         headers={"X-AutoDroid-Server": mock_upstream.base_url},
     )
     _warm_local_presence(client, {"MOCK2", "MOCK3"})
+    presence.set_token("req-tok")
 
     resp = client.get("/api/devices/", headers={"Authorization": "Bearer req-tok"})
     assert resp.status_code == 200
@@ -720,7 +721,10 @@ def test_devices_list_overlays_local_presence_and_heals_cloud(client, mock_upstr
         return [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/heartbeat")]
 
     assert _wait_until(lambda: len(heals()) >= 1), "应补发一次心跳让云端自愈"
-    assert json.loads(heals()[-1]["body"]) == {"serials": ["MOCK2"]}
+    heartbeat = json.loads(heals()[-1]["body"])
+    assert heartbeat["serials"] == ["MOCK2"]
+    assert heartbeat["client_instance_id"] == config_store.get_client_instance_id()
+    assert heartbeat["startup_capabilities"]["protocol_version"] == 1
     # 以当前请求用户身份上报（请求头的 Authorization），不依赖登录时捕获的 token
     assert heals()[-1]["headers"].get("authorization") == "Bearer req-tok"
 
@@ -777,6 +781,7 @@ def test_fastbot_devices_overlay_and_heal_parity(client, mock_upstream):
     _login(client, mock_upstream)
     _warm_local_presence(client, {"MOCK2"})
 
+    presence.set_token("req-tok")
     resp = client.get("/api/fastbot/devices?include_ios=true", headers={"Authorization": "Bearer req-tok"})
     assert resp.status_code == 200
     assert {d["serial"]: d["status"] for d in resp.json()} == {"MOCK2": "IDLE"}
@@ -785,7 +790,9 @@ def test_fastbot_devices_overlay_and_heal_parity(client, mock_upstream):
         return [r for r in mock_upstream.requests if r["path"].endswith("/api/client-devices/heartbeat")]
 
     assert _wait_until(lambda: len(heals()) >= 1), "测试页也要补心跳让云端自愈"
-    assert json.loads(heals()[-1]["body"]) == {"serials": ["MOCK2"]}
+    heartbeat = json.loads(heals()[-1]["body"])
+    assert heartbeat["serials"] == ["MOCK2"]
+    assert heartbeat["startup_capabilities"]["web_dispatch"] is True
     assert heals()[-1]["headers"].get("authorization") == "Bearer req-tok", "以请求用户身份上报"
 
 
@@ -927,7 +934,10 @@ def test_heartbeat_once_uses_light_local_serials(client, mock_upstream, monkeypa
 
         monkeypatch.setattr("engine.adb_scan.local_serials", lambda: {"USB2", "USB1"})
         assert asyncio.run(run()) == 1
-        assert json.loads(beats()[-1]["body"]) == {"serials": ["USB1", "USB2"]}
+        heartbeat = json.loads(beats()[-1]["body"])
+        assert heartbeat["serials"] == ["USB1", "USB2"]
+        assert heartbeat["client_instance_id"] == config_store.get_client_instance_id()
+        assert heartbeat["startup_capabilities"]["protocol_version"] == 1
     finally:
         presence.clear_token()
     assert scans == [], "心跳不得做全量属性扫描"

@@ -145,10 +145,14 @@ class MjpegHub:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._readers: List[Tuple[threading.Thread, threading.Event]] = []
 
     def subscribe(self, loop: asyncio.AbstractEventLoop) -> "asyncio.Queue[Optional[bytes]]":
         queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(maxsize=2)
         with self._lock:
+            if device_busy.exclusive_kind(self.serial) == device_busy.STARTUP:
+                queue.put_nowait(None)
+                return queue
             self._subs.append((loop, queue))
             if self.latest:
                 queue.put_nowait(self.latest)
@@ -158,6 +162,8 @@ class MjpegHub:
                 self._thread = threading.Thread(
                     target=self._run, args=(self._stop,), name=f"ios-mjpeg-{self.serial}", daemon=True
                 )
+                self._readers = [item for item in self._readers if item[0].is_alive()]
+                self._readers.append((self._thread, self._stop))
                 self._thread.start()
         return queue
 
@@ -176,6 +182,25 @@ class MjpegHub:
         with self._lock:
             self._stop.set()
 
+    def pause_for_collection(self) -> None:
+        """Drain a live reader before timed collection owns the WDA device."""
+        with self._lock:
+            readers = list(self._readers)
+            for _, stop in readers:
+                stop.set()
+        # A reconnect can already be waiting for WDA cold initialization or a
+        # bounded settings request. Drain every prior reader before timing;
+        # a failed drain must abort preflight, never race a new WDA session.
+        deadline = time.monotonic() + ios_device.WDA_RUN_WAIT_SECONDS + 20.0
+        for thread, _ in readers:
+            if thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                raise ios_device.IOSDeviceError("iOS 实时预览尚未结束，请稍后重新执行启动测试", status_code=409)
+        self.latest = None
+        self.last_error = "设备正在执行冷热启动测试，实时预览已暂停"
+        self._broadcast(None)
+
     def _broadcast(self, frame: Optional[bytes]) -> None:
         with self._lock:
             subs = list(self._subs)
@@ -188,6 +213,10 @@ class MjpegHub:
     def _run(self, stop: threading.Event) -> None:
         failures = 0
         while not stop.is_set():
+            if device_busy.exclusive_kind(self.serial) == device_busy.STARTUP:
+                self.last_error = "设备正在执行冷热启动测试，实时预览已暂停"
+                self._broadcast(None)
+                return
             try:
                 # 每次（重）连前确认 WDA 就绪：设备重插、WDA 被系统回收后这里会重新拉起
                 ios_device.wda_url(self.serial, wait_seconds=ios_device.WDA_RUN_WAIT_SECONDS)  # 页面显示连接中，等冷启动
@@ -263,12 +292,22 @@ _hubs_lock = threading.Lock()
 
 def mjpeg_hub(serial: str) -> MjpegHub:
     udid = udid_from_serial(serial)
+    if device_busy.exclusive_kind(udid) == device_busy.STARTUP:
+        raise ValueError("设备正在执行冷热启动测试，实时预览已暂停")
     with _hubs_lock:
         hub = _hubs.get(udid)
         if hub is None:
             hub = MjpegHub(udid)
             _hubs[udid] = hub
         return hub
+
+
+def pause_device(serial: str) -> None:
+    udid = udid_from_serial(serial)
+    with _hubs_lock:
+        hub = _hubs.get(udid)
+    if hub is not None:
+        hub.pause_for_collection()
 
 
 def shutdown() -> None:

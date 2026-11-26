@@ -851,4 +851,8 @@ def _ast_model_fields(class_name: str) -> Set[str]:
 def test_client_fastbot_payload_fields_match_platform(model_name):
     if not PLATFORM_CLIENT_FASTBOT.is_file():
         pytest.skip("平台仓库源码不在本机（跳过跨仓库漂移锁）")
-    assert _MIRRORS[model_name] == _ast_model_fields(model_name)
+    startup_extensions = {
+        "ClientFastbotTaskCreate": {"startup_config", "client_instance_id", "startup_capabilities"},
+        "ClientFastbotFinish": {"client_instance_id", "attempt", "claim_token"},
+    }
+    assert _MIRRORS[model_name] | startup_extensions.get(model_name, set()) == _ast_model_fields(model_name)

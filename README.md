@@ -159,6 +159,7 @@ macOS 下 `userData` 为 `~/Library/Application Support/AutoDroid`，Windows 为
 | 运行控制 | `GET /api/runs/active`、`POST /api/runs/cancel` |
 | 安装包 | `POST /api/packages/{id}/install`（从平台下载到本地后 `adb install`） |
 | Fastbot | `POST /api/fastbot/run`（本地轻量档采集：Monkey + logcat + 性能采样 + 崩溃异常回放；结果与回放产物上报 `client-fastbot`） |
+| 冷热启动 | `GET /api/fastbot/startup/devices`、`POST /api/fastbot/startup/run`、`POST /api/fastbot/startup/tasks/{id}/stop`、`GET /api/fastbot/startup/local-results`（Android / iOS 均在本机采集） |
 | 截图 | `GET /api/devices/{serial}/screenshot` |
 | iOS 投屏 | `GET /api/stream/ios-mjpeg/{serial}`、`WS /ws/ios-mjpeg/{serial}`：**显式降级**（WS 关闭码 4000 并给出原因），桌面端当前不提供 iOS 实时画面 |
 
@@ -172,6 +173,10 @@ macOS 下 `userData` 为 `~/Library/Application Support/AutoDroid`，Windows 为
 
 - **心跳**：登录后每 60 秒 `POST /api/client-devices/heartbeat`，退出登录时 `POST .../logout` 把设备置离线。
 - **定时任务**：`engine/core/task_scheduler.py` 每 300 秒拉取云端分配给本客户端的任务，用 APScheduler 在本机到点触发，语义对齐平台 `scheduler_service`。
+- **冷热启动派发**：登录后的引擎每 3 秒认领当前账号和实例的启动命令，保留云端同一 `task_id/run_id/attempt`；每 5 秒续租并上报部分结果。设备与用例、场景、Fastbot、录制交互互斥；取消或租约过期时停止后续动作，等待正在进行的设备请求结束后释放占用。退出登录会取消本账号采集。
+- **启动结果补传**：配置、已完成轮次及产物清单原子保存在 `userData/startup_runs/<run_id>/`，不落盘登录凭据或认领令牌。断网时保留结果并显示待同步，恢复登录所属账号后补传到原任务；客户端重启仅把未完成任务标记为中止并补传部分证据，不继续设备采样。已在当前进程验证过的同一登录可在断网时停止本机任务及查看结果。
+
+Android 冷启动保留 App 数据并确认旧进程已结束；热启动使用 Home 后恢复并验证进程未变化。Android `am start -W` 系统耗时、自动化控制耗时和业务就绪耗时分开记录。iOS 使用现有 WDA 启动/激活并验证应用状态，报告 WDA 自动化耗时与可选就绪耗时；WDA 耗时不等同于 iOS 系统首帧时间。慢启动 Trace 在原轮次启动前开始录制，Android 使用内置 Trace Processor 离线提取启动、主线程与调度证据。
 
 ## 与平台的接口
 
@@ -229,6 +234,7 @@ npm run test:smoke      # 真起引擎进程做端到端：client/info → 登�
 - 引擎用 PyInstaller **onedir** 打包（`engine.spec`，冷启动 1–2 秒；onefile 实测 28 秒已弃用），产物 `release-engine/autodroid-engine/`。
 - PyInstaller **不能跨平台**：Windows 引擎必须在 Windows 上构建，macOS 引擎在 macOS 上构建。
 - OCR 使用 RapidOCR 2.1.0 + ONNX Runtime 1.20.1（macOS 需 13.3+），随引擎打包中英文 PP-OCR 模型、字典及动态库，运行时无需安装 Python/PaddleOCR 或下载模型。更新依赖后先执行 `pip install -r requirements.txt`，再重新构建引擎。构建脚本在封装安装包前执行 `autodroid-engine --check-ocr`，通过实际文字识别检查内置组件是否可用；开发态可用 `python -m engine --check-ocr`。
+- 冷热启动采集模块及固定版 Perfetto Trace Processor v58.2 随引擎打包。构建前执行 `.venv/bin/python scripts/fetch-trace-processor.py`（可指定 `--platform mac-arm64|mac-x64|windows-x64`），校验清单固定官方 URL、版本、文件大小和 SHA256；`--verify-only` 只验本地文件，运行时不下载。安装包自检 `autodroid-engine --check-startup` 离线导入 Android/iOS 适配器、检查六列报告契约、核验工具哈希并执行 `--version`；缺模块或资源时打包失败。工具清单和第三方许可随资源分发。
 - 三类前置产物缺一不可，`scripts/check-dist-prereqs.sh` 在 `npm run dist*` 之前硬校验，缺件直接失败（electron-builder 对缺失的 `extraResources` 只告警不报错，否则会打出没有引擎 / 没有 UI / 没有 adb 的"死包"）：
   1. 前端 `../AutoDroid/frontend/dist/index.html`
   2. 引擎 `release-engine/autodroid-engine[.exe]`

@@ -222,11 +222,19 @@ async def device_screenshot(serial: str) -> Response:
     from engine.core import ios_device
     from engine.core.fastbot_ios.tools import is_ios_serial
 
+    def capture_ios():
+        from engine.core import device_busy
+
+        with device_busy.interaction(serial):
+            return ios_device.preview_screenshot(serial)
+
     if is_ios_serial(serial):
         try:
-            return JSONResponse(content=await asyncio.to_thread(ios_device.preview_screenshot, serial))
+            return JSONResponse(content=await asyncio.to_thread(capture_ios))
         except ios_device.IOSDeviceError as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     try:
         adb = resolve_adb_binary()
@@ -234,7 +242,15 @@ async def device_screenshot(serial: str) -> Response:
         return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     try:
-        raw = await asyncio.to_thread(_screencap_png, adb, serial)
+        def capture_android():
+            from engine.core import device_busy
+
+            with device_busy.interaction(serial):
+                return _screencap_png(adb, serial)
+
+        raw = await asyncio.to_thread(capture_android)
+    except ValueError as exc:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
     except _DeviceNotAttached as exc:
         return JSONResponse(
             status_code=404,
@@ -306,7 +322,15 @@ async def check_device_wda(serial: str) -> JSONResponse:
     wda_url = None
     error = None
     try:
-        wda_url = await asyncio.to_thread(ios_device.wda_url, serial)
+        def check_local_wda():
+            from engine.core import device_busy
+
+            with device_busy.interaction(serial):
+                return ios_device.wda_url(serial)
+
+        wda_url = await asyncio.to_thread(check_local_wda)
+    except ValueError as exc:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
     except ios_device.IOSDeviceError as exc:
         error = str(exc)
     return JSONResponse(
@@ -866,6 +890,93 @@ async def install_package_to_device(
 
 
 # --------------------------------------------------------------------------- #
+#  Startup collectors always run on this machine. Never proxy their POST to
+#  cloud ADB, even when an old server does not support the new protocol.
+# --------------------------------------------------------------------------- #
+
+@router.get("/api/fastbot/startup/devices")
+@router.get("/fastbot/startup/devices", include_in_schema=False)
+async def startup_devices_local(request: Request) -> JSONResponse:
+    from engine.core.startup_service import service
+
+    try:
+        with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+            return JSONResponse(content=await service.devices(bridge))
+    except httpx.HTTPStatusError as exc:
+        return JSONResponse(status_code=exc.response.status_code, content={"detail": "启动设备列表读取失败，请检查登录状态"})
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    except httpx.HTTPError:
+        return JSONResponse(status_code=502, content={"detail": "平台暂时不可达，请稍后重试"})
+
+
+@router.get("/api/fastbot/startup/local-results")
+@router.get("/fastbot/startup/local-results", include_in_schema=False)
+async def startup_results_local(request: Request) -> JSONResponse:
+    from engine.core.startup_service import service
+
+    try:
+        with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+            return JSONResponse(content=await service.local_results(bridge))
+    except (httpx.HTTPError, ValueError):
+        return JSONResponse(status_code=401, content={"detail": "请登录运行所属账号后读取本地结果"})
+
+
+@router.post("/api/fastbot/startup/run")
+@router.post("/fastbot/startup/run", include_in_schema=False)
+async def startup_run_local(request: Request, payload: Dict[str, Any]) -> JSONResponse:
+    from pydantic import ValidationError
+    from engine.core.startup_service import service
+
+    try:
+        with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+            result = await service.start(bridge, payload)
+            if any(not task.get("id") for task in result.get("tasks", [])):
+                return JSONResponse(status_code=503, content={"detail": {
+                    "code": "L1004_LAUNCH_RESULT_UNKNOWN",
+                    "message": "平台登记结果待确认，本次未采样的设备已停止；本地结果将在网络恢复后同步，请查看任务记录",
+                    "tasks": result["tasks"],
+                }})
+            return JSONResponse(content=result)
+    except ValidationError as exc:
+        return JSONResponse(status_code=422, content={"detail": exc.errors(include_context=False)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+    except httpx.HTTPStatusError as exc:
+        return JSONResponse(status_code=exc.response.status_code, content={"detail": "平台拒绝启动，请检查设备归属和客户端版本"})
+    except httpx.HTTPError:
+        return JSONResponse(status_code=502, content={"detail": "平台暂时不可达，尚未提交启动测试"})
+    except Exception as exc:
+        logger.exception("本地启动测试提交失败")
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@router.post("/api/fastbot/startup/tasks/{task_id}/stop")
+@router.post("/fastbot/startup/tasks/{task_id}/stop", include_in_schema=False)
+async def startup_stop_local(request: Request, task_id: int) -> JSONResponse:
+    from engine.core.startup_service import service
+
+    # Validate with cloud first. During an outage, only the exact login already
+    # authenticated in this process can stop its own local collector.
+    try:
+        with CloudBridge(auth_headers=auth_headers_from_request(request)) as bridge:
+            try:
+                response = await asyncio.to_thread(bridge.stop_startup, task_id)
+            except (httpx.ConnectError, httpx.TimeoutException):
+                if service.cancel_authenticated_local(bridge, task_id):
+                    return JSONResponse(content={"task_id": task_id, "cancel_requested": True,
+                        "local_cancel_requested": True, "sync_state": "pending",
+                        "message": "已请求停止本机采集，保留的部分结果将在网络恢复后同步"})
+                raise
+        local = service.cancel(task_id)
+        return JSONResponse(content={**response, "cancel_requested": True, "local_cancel_requested": local})
+    except httpx.HTTPStatusError as exc:
+        return JSONResponse(status_code=exc.response.status_code, content={"detail": "无法取消该启动任务"})
+    except httpx.HTTPError:
+        return JSONResponse(status_code=502, content={"detail": "平台暂时不可达，取消未确认"})
+
+
+# --------------------------------------------------------------------------- #
 #  Fastbot 智能探索本地拦截（P3-2 轻量档：采集本地 + client-fastbot 上报云端）
 # --------------------------------------------------------------------------- #
 
@@ -1002,14 +1113,16 @@ async def stream_device(serial: str) -> JSONResponse:
 @router.post("/stream/devices/{serial}/touch", include_in_schema=False)
 async def stream_touch(serial: str, payload: TouchEventPayload) -> JSONResponse:
     from engine.core.device_stream.manager import device_manager
+    from engine.core import device_busy
 
     try:
-        device_manager.send_touch_event(
-            serial, payload.action, payload.x, payload.y, method=payload.method
-        )
+        with device_busy.interaction(serial):
+            device_manager.send_touch_event(
+                serial, payload.action, payload.x, payload.y, method=payload.method
+            )
         return JSONResponse(content={"status": "ok"})
     except ValueError as exc:
-        return JSONResponse(status_code=404, content={"detail": str(exc)})
+        return JSONResponse(status_code=409 if device_busy.is_busy(serial) else 404, content={"detail": str(exc)})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"detail": str(exc)})
 

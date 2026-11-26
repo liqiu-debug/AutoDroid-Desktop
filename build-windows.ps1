@@ -66,6 +66,8 @@ if (-not (Test-Path '.venv\Scripts\python.exe')) {
 }
 .\.venv\Scripts\python.exe -m pip install --quiet --upgrade pip
 .\.venv\Scripts\python.exe -m pip install --quiet -r requirements.txt pyinstaller
+.\.venv\Scripts\python.exe scripts/fetch-trace-processor.py --platform windows-x64
+if ($LASTEXITCODE -ne 0) { Fail "Trace Processor 固定版本准备失败" }
 if (Test-Path 'release-engine') { Remove-Item -Recurse -Force 'release-engine' }
 if (Test-Path 'build-engine') { Remove-Item -Recurse -Force 'build-engine' }
 .\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm --distpath release-engine --workpath build-engine engine.spec
@@ -73,6 +75,8 @@ $engineExe = 'release-engine\autodroid-engine\autodroid-engine.exe'
 if (-not (Test-Path $engineExe)) { Fail "引擎产物缺失: $engineExe" }
 & $engineExe --check-ocr
 if ($LASTEXITCODE -ne 0) { Fail "内置 OCR 自检失败，请检查依赖和模型后重新构建引擎" }
+& $engineExe --check-startup
+if ($LASTEXITCODE -ne 0) { Fail "冷热启动模块自检失败，请重新构建引擎" }
 Ok "引擎就绪: $engineExe"
 
 # ---------- 2. 前端 dist（AutoDroid/frontend，缺省由脚本自动构建） ----------

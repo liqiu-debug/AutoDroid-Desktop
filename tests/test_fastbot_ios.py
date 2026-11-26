@@ -551,7 +551,7 @@ def test_start_rejected_while_local_case_runs_on_device(monkeypatch):
             fastbot_service.start_fastbot_run(
                 type("B", (), {"auth_headers": {}})(), {"device_serial": SERIAL, "package_name": "com.demo.app"}
             )
-        assert not device_busy.is_busy(SERIAL)
+        assert device_busy.is_busy(SERIAL), "拒绝Fastbot后不能释放仍在执行用例的原子占用"
     finally:
         run_registry.registry.complete(record.run_id)
 

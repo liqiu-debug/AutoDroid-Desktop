@@ -21,10 +21,11 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from functools import partial, wraps
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
-from engine.core import ios_device
+from engine.core import ios_device, device_busy
 from engine.core.device_transport_metrics import device_transport_metrics
 from engine.core.drivers.cross_platform_runner import TestCaseRunner as CrossPlatformRunner, _resolve_image_path
 from engine.core.locator_resolution import resolve_locator_candidates
@@ -60,6 +61,26 @@ class RecordingError(RuntimeError):
     def __init__(self, message: str, status_code: int = 500) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def _exclusive_operation(function):
+    """Recording must not race a collector between its busy check and I/O."""
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        values = signature.bind_partial(*args, **kwargs).arguments
+        serial = values.get("serial") or values.get("device_serial")
+        if not serial:
+            if any(kind == device_busy.STARTUP for kind in device_busy.snapshot().values()):
+                raise RecordingError("请先选择设备，冷热启动测试期间不能操作默认设备", status_code=409)
+            return function(*args, **kwargs)
+        try:
+            with device_busy.interaction(str(serial)):
+                return function(*args, **kwargs)
+        except ValueError as exc:
+            raise RecordingError(str(exc), status_code=409) from exc
+    return guarded
 
 
 class _RecordingAndroidDevicePool:
@@ -460,6 +481,7 @@ def crop_template_image(screenshot_base64: str, x1: int, y1: int, x2: int, y2: i
     return buffer.getvalue(), f"element_{uuid.uuid4().hex[:8]}.png"
 
 
+@_exclusive_operation
 def dump_device(
     serial: Optional[str] = None,
     include_device_info: bool = True,
@@ -488,6 +510,7 @@ def dump_device(
         _cleanup_recording_device(cleanup)
 
 
+@_exclusive_operation
 def inspect_device(x: int, y: int, serial: Optional[str] = None) -> Dict[str, Any]:
     cleanup = None
     platform = None
@@ -519,6 +542,7 @@ def inspect_device(x: int, y: int, serial: Optional[str] = None) -> Dict[str, An
         _cleanup_recording_device(cleanup)
 
 
+@_exclusive_operation
 def interact_device(
     x: int,
     y: int,
@@ -729,6 +753,7 @@ def localize_step_images(step: Dict[str, Any], ensure_local, platform: str = "an
     return step_item
 
 
+@_exclusive_operation
 def execute_single_step(
     step: Dict[str, Any],
     device_serial: Optional[str] = None,

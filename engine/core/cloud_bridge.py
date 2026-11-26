@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _UPLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
 DATA_TIMEOUT = httpx.Timeout(connect=3.0, read=15.0, write=5.0, pool=2.0)
 CREATE_RUN_TIMEOUT = httpx.Timeout(connect=3.0, read=5.0, write=5.0, pool=2.0)
+STARTUP_CONTROL_TIMEOUT = httpx.Timeout(connect=2.0, read=4.0, write=2.0, pool=1.0)
 
 
 def template_cache_dir() -> Path:
@@ -335,7 +336,7 @@ class CloudBridge:
         return self.post_json(f"/api/client-fastbot/{int(task_id)}/finish", payload, timeout=_UPLOAD_TIMEOUT)
 
     def upload_client_fastbot_artifact(
-        self, task_id: int, file_path: str, rel_path: str
+        self, task_id: int, file_path: str, rel_path: str, *, guard: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """POST /api/client-fastbot/{id}/artifacts（产物落 reports/fastbot/{id}/<rel_path>）。
 
@@ -353,8 +354,25 @@ class CloudBridge:
             return self.post_multipart(
                 f"/api/client-fastbot/{int(task_id)}/artifacts",
                 files,
-                {"path": str(rel_path)},
+                {"path": str(rel_path), **dict(guard or {})},
             )
+
+    # Startup commands use a lease/attempt guard on every mutation. The client
+    # never creates a second FastbotTask for a command claimed from the Web.
+    def claim_startup(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.post_json("/api/client-fastbot/startup/claim", payload, timeout=STARTUP_CONTROL_TIMEOUT)
+
+    def progress_startup(self, task_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.post_json(f"/api/client-fastbot/startup/{int(task_id)}/progress", payload, timeout=STARTUP_CONTROL_TIMEOUT)
+
+    def finish_startup(self, task_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.post_json(f"/api/client-fastbot/startup/{int(task_id)}/finish", payload, timeout=_UPLOAD_TIMEOUT)
+
+    def recover_startup(self, task_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.post_json(f"/api/client-fastbot/startup/{int(task_id)}/recover", payload, timeout=STARTUP_CONTROL_TIMEOUT)
+
+    def stop_startup(self, task_id: int) -> Dict[str, Any]:
+        return self.post_json(f"/api/fastbot/startup/tasks/{int(task_id)}/stop", {}, timeout=STARTUP_CONTROL_TIMEOUT)
 
 def auth_headers_from_request(request: Any) -> Dict[str, str]:
     """从入站请求摘鉴权头（Authorization/cookie）；无则回退登录 token。"""

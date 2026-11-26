@@ -125,8 +125,10 @@ def wda_url(serial: str, wait_seconds: Optional[float] = None) -> str:
 
 def ensure_not_in_stability_run(serial: str) -> None:
     """稳定性测试独占 WDA 会话：此时新建会话会顶掉测试会话（见模块说明）。"""
-    if device_busy.is_busy(serial) or device_busy.is_busy(_udid(serial)):
-        raise IOSDeviceError(STABILITY_RUNNING_DETAIL, status_code=409)
+    kind = device_busy.exclusive_kind(serial) or device_busy.exclusive_kind(_udid(serial))
+    if kind:
+        detail = "该设备正在执行冷热启动测试，请等测试结束后再操作" if kind == "startup" else STABILITY_RUNNING_DETAIL
+        raise IOSDeviceError(detail, status_code=409)
 
 
 def execution_wda_url(serial: str, wait_seconds: Optional[float] = None) -> str:
@@ -165,19 +167,45 @@ class IOSDriverPool:
         return IOSDriver(device_id=udid, wda_url=url)
 
     def _entry_for(self, udid: str) -> _Entry:
-        stale: List[_Entry] = []
         with self._lock:
             now = time.time()
             for key, item in list(self._entries.items()):
                 if key != udid and not item.lock.locked() and now - item.last_used_at > RECORDING_IOS_IDLE_TTL_SECONDS:
-                    stale.append(self._entries.pop(key))
+                    self._entries.pop(key)
+                    # Serialize destruction with drain_for_collection. An
+                    # entry removed here must finish disconnecting before a
+                    # collector creates its exclusive WDA session.
+                    _close_driver(item.driver)
             entry = self._entries.get(udid)
             if entry is None:
                 entry = _Entry(udid)
                 self._entries[udid] = entry
-        for item in stale:
-            _close_driver(item.driver)
         return entry
+
+    def drain_for_collection(self, serial: str) -> None:
+        """Close the old recording entry after acquiring its actual lock.
+
+        The caller already holds the device's collector lease. Never release a
+        recording request's lock from another thread, even during cancellation.
+        """
+        udid = _udid(serial)
+        deadline = time.monotonic() + DRIVER_LOCK_WAIT_SECONDS
+        while True:
+            with self._lock:
+                entry = self._entries.get(udid)
+                if entry is None:
+                    return
+            if not entry.lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                raise IOSDeviceError("iOS 录制操作尚未结束，请稍后重新执行启动测试", status_code=409)
+            try:
+                with self._lock:
+                    if self._entries.get(udid) is not entry:
+                        continue
+                    self._entries.pop(udid)
+                    _close_driver(entry.driver)
+                    return
+            finally:
+                entry.lock.release()
 
     def acquire(self, serial: str) -> Any:
         """取该设备的驱动并持有其锁；用完必须 release（或 invalidate）。"""
@@ -194,6 +222,9 @@ class IOSDriverPool:
                 break
             entry.lock.release()  # 等锁期间条目已失效（invalidate / 上一个持有者连接失败）
         try:
+            # Recheck after acquiring the recording pool lock. A collector can
+            # reserve the device while an earlier recording request is waiting.
+            ensure_not_in_stability_run(serial)
             if entry.driver is None:
                 entry.driver = self._new_driver(udid, wda_url(serial))
             elif time.time() - entry.last_used_at > WDA_RECHECK_IDLE_SECONDS:
@@ -232,19 +263,21 @@ class IOSDriverPool:
             if entry is None or entry.driver is not driver:
                 return
             self._entries.pop(udid, None)
+            # Complete close before a collector can drain this UDID and create
+            # another WDA session.
+            _close_driver(driver)
         if entry.lock.locked():
             try:
                 entry.lock.release()
             except RuntimeError:
                 pass
-        _close_driver(driver)
 
     def close_all(self) -> None:
         with self._lock:
             entries = list(self._entries.values())
             self._entries.clear()
-        for entry in entries:
-            _close_driver(entry.driver)
+            for entry in entries:
+                _close_driver(entry.driver)
 
 
 def _close_driver(driver: Any) -> None:
@@ -324,6 +357,7 @@ def preview_screenshot(serial: str) -> Dict[str, str]:
     import httpx
     from PIL import Image
 
+    ensure_not_in_stability_run(serial)
     url = wda_url(serial)
     try:
         resp = httpx.get(f"{url}/screenshot", timeout=PREVIEW_SCREENSHOT_TIMEOUT_SECONDS)

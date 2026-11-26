@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
 
 _token: Optional[str] = None
+_retired_tokens: List[str] = []
 _heartbeat_task: Optional[asyncio.Task] = None
 
 
@@ -46,11 +47,27 @@ def heartbeat_interval_seconds() -> float:
 def set_token(token: Optional[str]) -> None:
     """登记登录 token（仅内存）。"""
     global _token
-    _token = (token or "").strip() or None
+    normalized = (token or "").strip() or None
+    if _token and _token != normalized:
+        _retired_tokens.append(_token)
+        del _retired_tokens[:-64]
+        # A collector belongs to the captured account. Logging out or switching
+        # accounts cancels it; an outbox is only retried after owner validation.
+        from engine.core.startup_service import service
+
+        service.cancel_session()
+    if normalized in _retired_tokens:
+        _retired_tokens.remove(normalized)
+    _token = normalized
 
 
 def get_token() -> Optional[str]:
     return _token
+
+
+def can_adopt_request_token(token: str) -> bool:
+    """A late request from a logged-out renderer must not restart its worker."""
+    return bool(token) and token not in _retired_tokens
 
 
 def clear_token() -> None:
@@ -117,7 +134,10 @@ async def heartbeat_once(
     if not serials:
         return 0
     resp = await _post_json(
-        http, upstream, "/api/client-devices/heartbeat", {"serials": serials}, headers=auth_headers
+        http, upstream, "/api/client-devices/heartbeat", {
+            "serials": serials, "client_instance_id": config_store.get_client_instance_id(),
+            "startup_capabilities": _startup_capabilities(),
+        }, headers=auth_headers
     )
     if resp is None or resp.status_code // 100 != 2:
         if resp is not None:
@@ -135,6 +155,9 @@ async def logout_once(
     http: httpx.AsyncClient,
     serials: Optional[List[str]] = None,
     client_instance_id: Optional[str] = None,
+    *,
+    auth_headers: Optional[Dict[str, str]] = None,
+    upstream: Optional[str] = None,
 ) -> None:
     """退出/进程停止时把本客户端设备置 OFFLINE（best-effort）。
 
@@ -142,13 +165,14 @@ async def logout_once(
     （或本机另一实例）仍在线的设备不受影响，否则会被一并打成离线、直到对方下一次
     心跳才恢复。
     """
-    upstream = config_store.get_upstream()
-    if not upstream or not get_token():
+    upstream = upstream or config_store.get_upstream()
+    headers = dict(auth_headers) if auth_headers is not None else _auth_headers()
+    if not upstream or not headers:
         return
     payload: Dict[str, Any] = {"serials": serials} if serials is not None else {}
     if client_instance_id:
         payload["client_instance_id"] = client_instance_id
-    resp = await _post_json(http, upstream, "/api/client-devices/logout", payload, timeout=5.0)
+    resp = await _post_json(http, upstream, "/api/client-devices/logout", payload, timeout=5.0, headers=headers)
     if resp is not None and resp.status_code // 100 != 2:
         logger.warning("logout 上报被拒: status=%s body=%s", resp.status_code, resp.text[:200])
 
@@ -191,3 +215,10 @@ def reset_for_tests() -> None:
     global _heartbeat_task
     stop_heartbeat_loop()
     clear_token()
+    _retired_tokens.clear()
+
+
+def _startup_capabilities() -> Dict[str, Any]:
+    from engine.core.startup_service import capabilities
+
+    return capabilities()

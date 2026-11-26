@@ -45,6 +45,18 @@ def _setup_file_logging() -> logging.Handler | None:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--check-startup"]:
+        import asyncio
+        import json
+
+        try:
+            from engine.core.startup_selfcheck import check_startup
+
+            print(json.dumps(asyncio.run(check_startup()), ensure_ascii=False), flush=True)
+            return 0
+        except Exception as exc:
+            print(json.dumps({"ok": False, "offline": True, "error": str(exc)}, ensure_ascii=False), flush=True)
+            return 1
     if sys.argv[1:2] == ["--check-image-match"]:
         import json
         import traceback

@@ -10,3 +10,7 @@ __pycache__/
 release-engine/
 build-engine/
 assets/platform-tools/
+assets/trace_processor/
+/artifacts/startup-20261125/
+/artifacts/startup-20261126-device-status/
+/artifacts/startup-trace-offline-20261125/

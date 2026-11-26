@@ -223,6 +223,9 @@ def create_app() -> FastAPI:
         }
         app.state.presence_heal = {"ts": 0.0, "task": None}
         app.state.http = httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=False)
+        from engine.core import startup_service
+
+        app.state.startup_worker = startup_service.start_worker()
         # 在场缓存常驻刷新：长时间静止（没人查设备列表）时缓存也不过期，
         # 否则测试页只查 /api/fastbot/devices，覆盖会随缓存过期而失效
         app.state.start_local_presence_loop()
@@ -243,6 +246,11 @@ def create_app() -> FastAPI:
             yield
         finally:
             await app.state.launch_requests.close(grace_period=35.0)
+            # Cancel collectors before tearing down WDA/HTTP. Interrupted
+            # snapshots are durable and reconciled as ABORTED after restart.
+            app.state.startup_worker.cancel()
+            await asyncio.gather(app.state.startup_worker, return_exceptions=True)
+            await startup_service.service.shutdown(timeout=20.0)
             # 进程退出/托盘退出（SIGTERM → lifespan shutdown）时 best-effort
             # 把本实例登记的设备置 OFFLINE，再停心跳、关设备流、关 HTTP 客户端。
             for background in (app.state.device_discovery, app.state.local_presence, app.state.presence_heal):
@@ -288,11 +296,12 @@ def create_app() -> FastAPI:
     @app.get("/api/client/info")
     async def client_info() -> JSONResponse:
         from engine.core.utils.image_match import matcher_capabilities
+        from engine.core.startup_service import capabilities as startup_capabilities
         return JSONResponse(
             content={"clientMode": True, "platform": platform_name(), "version": client_version(),
                      "execution_preflight_v1": True, "launch_idempotency": True,
                      "engine_instance_id": ENGINE_INSTANCE_ID,
-                     "image_matcher": matcher_capabilities()}
+                     "image_matcher": matcher_capabilities(), "startup": startup_capabilities()}
         )
 
     @app.post("/api/auth/token")
@@ -348,6 +357,36 @@ def create_app() -> FastAPI:
         result = Response(content=content, status_code=upstream_response.status_code)
         return apply_headers(result, response_headers)
 
+    @app.post("/api/client/session/logout")
+    async def client_session_logout(request: Request) -> Response:
+        token = request_bearer_token(request)
+        if not token:
+            return JSONResponse(status_code=401, content={"detail": "退出本机会话需要当前登录凭据"})
+        if token != presence.get_token():
+            # A prior renderer's delayed logout must never clear a new login.
+            return JSONResponse(content={"logged_out": False, "session_changed": True})
+        upstream = config_store.get_upstream()
+        # Revoke the worker and cancel collectors before any cloud await. A
+        # concurrent new login is free to install its own token and heartbeat.
+        presence.clear_token()
+        presence.stop_heartbeat_loop()
+        try:
+            await presence.logout_once(request.app.state.http,
+                client_instance_id=config_store.get_client_instance_id(),
+                auth_headers={"Authorization": f"Bearer {token}"}, upstream=upstream)
+        except Exception:
+            logger.info("退出平台状态暂未同步，本机会话已停止")
+        return JSONResponse(content={"logged_out": True})
+
+    def _current_request_session(auth_headers: Dict[str, str], upstream: str) -> bool:
+        headers = {key.lower(): value for key, value in auth_headers.items()}
+        raw = str(headers.get("authorization") or "")
+        scheme, _, token = raw.partition(" ")
+        token = token.strip()
+        return (scheme.lower() == "bearer" and token == presence.get_token()
+                and presence.can_adopt_request_token(token)
+                and upstream == config_store.get_upstream())
+
     async def _register_local_devices(
         http: httpx.AsyncClient,
         auth_headers: dict,
@@ -361,8 +400,12 @@ def create_app() -> FastAPI:
         （一键同步语义）。
         """
         infos = await asyncio.to_thread(scan_devices)
+        if not _current_request_session(auth_headers, upstream):
+            return 0
         synced = 0
         for info in infos:
+            if not _current_request_session(auth_headers, upstream):
+                break
             serial = str(info.get("serial") or "").strip()
             if not serial:
                 continue
@@ -370,6 +413,9 @@ def create_app() -> FastAPI:
                 continue
             payload = dict(info)
             payload["client_instance_id"] = config_store.get_client_instance_id()
+            from engine.core.startup_service import capabilities as startup_capabilities
+
+            payload["startup_capabilities"] = startup_capabilities()
             register_url = f"{upstream.rstrip('/')}/api/client-devices/register"
             try:
                 resp = await http.post(register_url, json=payload, headers=auth_headers)
@@ -453,6 +499,8 @@ def create_app() -> FastAPI:
         一次请求要等完整 adb 属性扫描（6 次往返）才回列表，既拖慢轮询又加重设备上
         的 adb 负载。改为后台任务后本次响应不含刚登记的新设备，下一轮轮询即可见。
         """
+        if not _current_request_session(auth_headers, upstream):
+            return
         state = app.state.device_discovery
         lock = app.state.device_discovery_lock
         if time.monotonic() - state["ts"] < DEVICE_DISCOVERY_INTERVAL_SECONDS or lock.locked():
@@ -487,7 +535,15 @@ def create_app() -> FastAPI:
         token = request_bearer_token(request)
         if not token:
             return
-        if presence.get_token() != token:
+        current = presence.get_token()
+        if current and current != token:
+            # Account switches come from an explicit auth/token response.
+            # Late device-list responses from a previous login cannot switch
+            # the command worker back to that identity.
+            return
+        if current is None:
+            if not presence.can_adopt_request_token(token):
+                return
             presence.set_token(token)
         presence.start_heartbeat_loop(app.state.http)
 
@@ -537,6 +593,8 @@ def create_app() -> FastAPI:
         return state["serials"]
 
     async def _heal_presence(auth_headers: Dict[str, str], serials: List[str]) -> None:
+        if not _current_request_session(auth_headers, config_store.get_upstream()):
+            return
         try:
             updated = await presence.heartbeat_once(
                 app.state.http, serials=serials, auth_headers=auth_headers
@@ -552,6 +610,8 @@ def create_app() -> FastAPI:
         列表覆盖只修本客户端看到的状态；补心跳把云端 last_seen_at 拉回来，其他
         消费方（Web 端、定时任务选设备）也随之恢复。
         """
+        if not _current_request_session(auth_headers, config_store.get_upstream()):
+            return
         state = app.state.presence_heal
         task = state.get("task")
         if task is not None and not task.done():

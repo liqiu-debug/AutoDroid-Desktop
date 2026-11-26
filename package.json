@@ -1,7 +1,7 @@
 {
   "name": "autodroid-desktop",
   "productName": "AutoDroid",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "AutoDroid 桌面客户端（Electron 壳 + 本地引擎网关）",
   "main": "main.js",
   "license": "MIT",
@@ -45,6 +45,7 @@
       "*.js",
       "assets/**/*",
       "!assets/platform-tools/**",
+      "!assets/trace_processor/**",
       "engine/**/*.py",
       "package.json"
     ],
@@ -69,7 +70,9 @@
         "filter": [
           "**/*",
           "!platform-tools",
-          "!platform-tools/**/*"
+          "!platform-tools/**/*",
+          "!trace_processor",
+          "!trace_processor/**/*"
         ]
       }
     ],
@@ -129,6 +132,9 @@
         }
       ],
       "category": "public.app-category.developer-tools",
+      "signIgnore": [
+        "trace_processor/.*/trace_processor_shell$"
+      ],
       "minimumSystemVersion": "13.3",
       "icon": "assets/icon.icns"
     }
