@@ -534,3 +534,97 @@ def test_ios_mjpeg_ws_rejects_illegal_serial_with_4004(client, mock_cloud):
             ws.receive_bytes()
     assert exc.value.code == 4004
     assert not [r for r in mock_cloud.requests if "ios-mjpeg" in r["path"]]
+
+
+def test_desktop_interact_uses_request_locator_config_without_cloud_fetch(client, mock_cloud, monkeypatch):
+    from engine import local_api
+    from engine.core import recording_service
+
+    calls = {"cloud_fetch": 0}
+    monkeypatch.setattr(
+        local_api.CloudBridge,
+        "fetch_settings_map",
+        lambda self, *a, **kw: calls.__setitem__("cloud_fetch", calls["cloud_fetch"] + 1) or {},
+    )
+
+    xml = """
+    <hierarchy rotation="0">
+      <node index="0" text="" resource-id="com.demo:id/only_icon" class="android.widget.ImageView" content-desc="" clickable="true" bounds="[40,80][140,180]" />
+    </hierarchy>
+    """
+
+    class _FakeDev:
+        def __init__(self):
+            self.clicked = []
+
+        def dump_hierarchy(self):
+            return xml
+
+        def click(self, x, y):
+            self.clicked.append((x, y))
+
+    fake_dev = _FakeDev()
+    monkeypatch.setattr(recording_service._recording_android_device_pool, "acquire", lambda s: fake_dev)
+
+    resp = client.post(
+        "/api/device/interact",
+        json={
+            "x": 90,
+            "y": 130,
+            "operation": "click",
+            "device_serial": "127.0.0.1:5555",
+            "include_screenshot": False,
+            "include_device_info": False,
+            "locator_config": {
+                "recording_enable_resource_id": True,
+                "recording_enable_class_name": False,
+                "recording_locator_priority": "semantic_first",
+            },
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["step"]["selector_type"] == "resourceId"
+    assert body["step"]["selector"] == "com.demo:id/only_icon"
+    assert calls["cloud_fetch"] == 0
+
+
+def test_desktop_inspect_falls_back_to_cloud_settings_with_ttl_cache(client, mock_cloud, monkeypatch):
+    from engine import local_api
+    from engine.core import recording_service
+
+    local_api._recording_locator_cache.clear()
+    fetch_count = {"n": 0}
+
+    def _fake_fetch(self, *args, **kwargs):
+        fetch_count["n"] += 1
+        return {
+            "recording_enable_resource_id": "true",
+            "recording_enable_class_name": "false",
+            "recording_locator_priority": "id_first",
+        }
+
+    monkeypatch.setattr(local_api.CloudBridge, "fetch_settings_map", _fake_fetch)
+
+    xml = """
+    <hierarchy rotation="0">
+      <node index="0" text="" resource-id="com.demo:id/gear" class="android.widget.ImageView" content-desc="" clickable="true" bounds="[40,80][140,180]" />
+    </hierarchy>
+    """
+
+    class _FakeDev:
+        def dump_hierarchy(self):
+            return xml
+
+    monkeypatch.setattr(recording_service._recording_android_device_pool, "acquire", lambda s: _FakeDev())
+
+    r1 = client.post("/api/device/inspect?serial=USB1&x=90&y=130")
+    assert r1.status_code == 200
+    assert r1.json()["strategy"] == "resourceId"
+    assert r1.json()["selector"] == "com.demo:id/gear"
+
+    r2 = client.post("/api/device/inspect?serial=USB1&x=90&y=130")
+    assert r2.status_code == 200
+    assert r2.json()["strategy"] == "resourceId"
+    assert fetch_count["n"] == 1
+

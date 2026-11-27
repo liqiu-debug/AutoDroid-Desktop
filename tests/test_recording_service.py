@@ -376,3 +376,47 @@ def test_execute_single_step_localizes_template_image(fake_device, monkeypatch):
         ensure_local=lambda p: f"/cache/{p.rsplit('/', 1)[-1]}",
     )
     assert captured["step"]["args"]["image_path"] == "/cache/element_zz.png"
+
+
+def test_desktop_recording_service_composite_and_ambiguous_handling(monkeypatch):
+    xml = """
+    <hierarchy rotation="0">
+      <node index="0" text="立即支付" resource-id="com.demo:id/pay" class="android.widget.Button" content-desc="" clickable="true" bounds="[40,300][500,400]" />
+      <node index="1" text="取消" resource-id="com.demo:id/pay" class="android.widget.Button" content-desc="" clickable="true" bounds="[40,420][500,520]" />
+      <node index="2" text="" resource-id="com.demo:id/dup_icon" class="android.widget.ImageView" content-desc="" clickable="true" bounds="[40,600][140,700]" />
+      <node index="3" text="" resource-id="com.demo:id/dup_icon" class="android.widget.ImageView" content-desc="" clickable="true" bounds="[40,750][140,850]" />
+    </hierarchy>
+    """
+
+    class _FakeAndroidDev:
+        def dump_hierarchy(self):
+            return xml
+
+    monkeypatch.setattr(
+        recording_service._recording_android_device_pool,
+        "acquire",
+        lambda serial: _FakeAndroidDev(),
+    )
+
+    inspected = recording_service.inspect_device(
+        x=200,
+        y=350,
+        serial="USB1",
+        locator_config={
+            "enable_resource_id": True,
+            "enable_class_name": False,
+            "priority": "id_first",
+        },
+    )
+    assert inspected["strategy"] == "composite"
+    assert inspected["selector"] == '{"id":"com.demo:id/pay","text":"立即支付"}'
+
+    # 重复纯图标在启用 ID 后仍应报 RecordingError(status_code=400) + CLICK_AMBIGUOUS_LOCATOR_DETAIL
+    with pytest.raises(recording_service.RecordingError) as exc:
+        recording_service._build_click_step_from_inspect_result(
+            {"strategy": "ambiguous", "selector": "", "element": {"bounds": "[40,600][140,700]"}},
+            locator_config={"enable_resource_id": True},
+        )
+    assert exc.value.status_code == 400
+    assert str(exc.value) == recording_service.CLICK_AMBIGUOUS_LOCATOR_DETAIL
+

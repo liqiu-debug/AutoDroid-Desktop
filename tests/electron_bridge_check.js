@@ -716,6 +716,37 @@ app.whenReady().then(async () => {
     'startEngine 入口应先 discardEngineChild(engineProcess)'
   )
 
+  // 7n. 启动隐窗（windowsHide）、will-quit 等待引擎停止、历史更新包清理
+  check('main.js spawn 启用 windowsHide 避免 Windows 弹黑窗', mainSrc.includes('windowsHide: true'))
+  check(
+    'main.js will-quit 等待 stopEngine 完成',
+    mainSrc.includes('event.preventDefault()') && mainSrc.includes('stopEngine().finally(')
+  )
+  const cleanupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autodroid-cleanup-'))
+  fs.writeFileSync(path.join(cleanupDir, 'AutoDroid-Setup-1.0.0.exe'), 'old-exe')
+  fs.writeFileSync(path.join(cleanupDir, 'AutoDroid-1.0.0.dmg'), 'old-dmg')
+  fs.writeFileSync(path.join(cleanupDir, 'AutoDroid-1.0.0.dmg.part'), 'old-part')
+  fs.writeFileSync(path.join(cleanupDir, 'AutoDroid-1.0.1.dmg'), 'keep-dmg')
+  fs.writeFileSync(path.join(cleanupDir, 'AutoDroid-1.0.1.dmg.part'), 'keep-part')
+  fs.writeFileSync(path.join(cleanupDir, 'apply-update.sh'), '#!/bin/sh\n')
+  fs.writeFileSync(path.join(cleanupDir, 'update-state.json'), '{}')
+  const removedArtifacts = updater.cleanupOldUpdateArtifacts({
+    dir: cleanupDir,
+    keepFileName: 'AutoDroid-1.0.1.dmg',
+  })
+  check(
+    'cleanupOldUpdateArtifacts 清掉旧包并保留当前版本与状态文件',
+    removedArtifacts.includes('AutoDroid-Setup-1.0.0.exe') &&
+      removedArtifacts.includes('AutoDroid-1.0.0.dmg') &&
+      removedArtifacts.includes('AutoDroid-1.0.0.dmg.part') &&
+      removedArtifacts.includes('apply-update.sh') &&
+      fs.existsSync(path.join(cleanupDir, 'AutoDroid-1.0.1.dmg')) &&
+      fs.existsSync(path.join(cleanupDir, 'AutoDroid-1.0.1.dmg.part')) &&
+      fs.existsSync(path.join(cleanupDir, 'update-state.json')),
+    JSON.stringify(removedArtifacts)
+  )
+  fs.rmSync(cleanupDir, { recursive: true, force: true })
+
   updateServer.close()
 
   win.destroy()

@@ -32,6 +32,8 @@ import io
 import json
 import logging
 import subprocess
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -42,6 +44,7 @@ from fastapi import APIRouter, Body, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
+from engine import config_store
 from engine.core import recording_service
 from engine.core.cloud_bridge import CloudBridge, auth_headers_from_request, template_cache_dir
 from engine.core.launch_requests import (
@@ -123,6 +126,83 @@ class InteractionPayload(BaseModel):
     include_screenshot: bool = True
     # 快赢：device_info 按需（前端有缓存兜底；显式 true 时随 dump 返回）
     include_device_info: bool = False
+    locator_config: Optional[Dict[str, Any]] = None
+
+
+_RECORDING_LOCATOR_CACHE_TTL_SECONDS = 10.0
+_recording_locator_cache: Dict[tuple[str, str], tuple[float, Dict[str, Any]]] = {}
+_recording_locator_cache_lock = threading.Lock()
+_TRUE_BOOL_TEXTS = {"1", "true", "yes", "on", "enabled"}
+
+
+def _coerce_locator_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in _TRUE_BOOL_TEXTS:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _parse_recording_locator_config(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    source = raw if isinstance(raw, dict) else {}
+    enable_id_raw = (
+        source.get("enable_resource_id")
+        if "enable_resource_id" in source
+        else source.get("recording_enable_resource_id")
+    )
+    enable_class_raw = (
+        source.get("enable_class_name")
+        if "enable_class_name" in source
+        else source.get("recording_enable_class_name")
+    )
+    priority_raw = (
+        source.get("priority")
+        if "priority" in source
+        else source.get("recording_locator_priority")
+    )
+    priority = "id_first" if str(priority_raw or "").strip().lower() == "id_first" else "semantic_first"
+    return {
+        "enable_resource_id": _coerce_locator_bool(enable_id_raw, default=False),
+        "enable_class_name": _coerce_locator_bool(enable_class_raw, default=False),
+        "priority": priority,
+    }
+
+
+def _resolve_recording_locator_config(
+    request: Request,
+    explicit_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if isinstance(explicit_config, dict):
+        return _parse_recording_locator_config(explicit_config)
+
+    auth_headers = auth_headers_from_request(request)
+    auth_key = auth_headers.get("authorization") or auth_headers.get("Authorization") or ""
+    upstream_key = config_store.get_upstream() or ""
+    cache_key = (upstream_key, auth_key)
+    now = time.monotonic()
+
+    with _recording_locator_cache_lock:
+        cached = _recording_locator_cache.get(cache_key)
+        if cached and (now - cached[0]) < _RECORDING_LOCATOR_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+
+    parsed = _parse_recording_locator_config(None)
+    if upstream_key:
+        try:
+            with CloudBridge(auth_headers=auth_headers) as bridge:
+                settings_map = bridge.fetch_settings_map()
+            parsed = _parse_recording_locator_config(settings_map)
+        except Exception as exc:
+            logger.debug("拉取录制定位配置失败，使用默认值: %s", exc)
+
+    with _recording_locator_cache_lock:
+        _recording_locator_cache[cache_key] = (time.monotonic(), dict(parsed))
+    return parsed
 
 
 class SingleStepPayload(BaseModel):
@@ -146,13 +226,15 @@ class CropTemplatePayload(BaseModel):
 @router.post("/api/device/inspect")
 @router.post("/device/inspect", include_in_schema=False)
 async def inspect_device(
+    request: Request,
     x: int,
     y: int,
     serial: Optional[str] = None,
 ) -> JSONResponse:
     """审查模式：返回指定坐标处的最佳元素和定位策略。"""
     try:
-        payload = await _to_thread(recording_service.inspect_device, x, y, serial)
+        locator_cfg = await _to_thread(_resolve_recording_locator_config, request, None)
+        payload = await _to_thread(recording_service.inspect_device, x, y, serial, locator_cfg)
     except RecordingError as exc:
         return _error_response(exc)
     return JSONResponse(content=payload)
@@ -163,6 +245,11 @@ async def inspect_device(
 async def interact_with_device(request: Request, payload: InteractionPayload) -> Response:
     """交互模式：分析元素 → 执行点击 → 等待 UI 稳定 → 返回新状态。"""
     try:
+        locator_cfg = (
+            await _to_thread(_resolve_recording_locator_config, request, payload.locator_config)
+            if (payload.operation == "click" and payload.record_step)
+            else None
+        )
         result = await _to_thread(
             recording_service.interact_device,
             x=payload.x,
@@ -174,6 +261,7 @@ async def interact_with_device(request: Request, payload: InteractionPayload) ->
             record_step=payload.record_step,
             include_screenshot=payload.include_screenshot,
             include_device_info=payload.include_device_info,
+            locator_config=locator_cfg,
         )
     except RecordingError as exc:
         return _error_response(exc)
@@ -710,13 +798,20 @@ async def websocket_run_case(websocket: WebSocket, case_id: int) -> None:
     except (TypeError, ValueError):
         env_id = None
     device_serial = websocket.query_params.get("device_serial") or None
+    try:
+        start_step_raw = websocket.query_params.get("start_step_index")
+        start_step_index = max(0, int(start_step_raw)) if start_step_raw not in (None, "") else 0
+    except (TypeError, ValueError):
+        start_step_index = 0
 
+    kwargs = {"start_step_index": start_step_index} if start_step_index > 0 else {}
     await runner_service.run_case_via_websocket(
         websocket,
         case_id,
         env_id,
         device_serial,
         auth_headers_from_request(websocket),
+        **kwargs,
     )
 
 

@@ -469,6 +469,54 @@ function clearUpdateState() {
 }
 
 /**
+ * 清理 userData/updates 目录下遗留的历史安装包与临时分片文件，避免长期占用磁盘。
+ */
+function cleanupOldUpdateArtifacts(options = {}) {
+  const dir = options.dir || updatesDir()
+  if (!fs.existsSync(dir)) {
+    return []
+  }
+  const keep = new Set()
+  if (options.keepFileName && isSafeFileName(options.keepFileName)) {
+    keep.add(String(options.keepFileName))
+  }
+  const state = stagedUpdate || readUpdateState()
+  if (state && isSafeFileName(state.fileName)) {
+    keep.add(String(state.fileName))
+  }
+  const keepActivePart = options.keepActivePart !== false
+  const removed = []
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch (error) {
+    return removed
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue
+    }
+    const name = entry.name
+    if (keep.has(name)) {
+      continue
+    }
+    if (keepActivePart && name.endsWith('.part') && keep.has(name.slice(0, -5))) {
+      continue
+    }
+    if (!/\.(dmg|exe|zip|part)$/i.test(name) && name !== 'apply-update.sh') {
+      continue
+    }
+    try {
+      fs.rmSync(path.join(dir, name), { force: true })
+      removed.push(name)
+    } catch (error) {
+      // 占用或权限异常时不阻断主流程
+    }
+  }
+  return removed
+}
+
+/**
  * 应用已暂存的更新：等本进程退出后改名换包并重启。
  *
  * 换包在独立 shell 脚本里做（进程已退出才能替换运行中的 app 包）：
@@ -485,15 +533,18 @@ function applyStagedUpdate() {
   }
   const scriptPath = path.join(updatesDir(), 'apply-update.sh')
   const backupPath = `${state.appPath}.old-${Date.now()}`
+  const dmgPath = isSafeFileName(state.fileName) ? path.join(updatesDir(), String(state.fileName)) : ''
   const script = [
     '#!/bin/sh',
+    'BACKUP="$1"',
+    'APP="$2"',
+    'NEW="$3"',
+    'DMG="$4"',
     `while kill -0 ${process.pid} 2>/dev/null; do sleep 0.2; done`,
-    `BACKUP='${backupPath}'`,
-    `APP='${state.appPath}'`,
-    `NEW='${state.stagedPath}'`,
     'if mv "$APP" "$BACKUP" 2>/dev/null; then',
     '  if mv "$NEW" "$APP" 2>/dev/null; then',
     '    rm -rf "$BACKUP"',
+    '    if [ -n "$DMG" ] && [ -f "$DMG" ]; then rm -f "$DMG"; fi',
     '  else',
     '    mv "$BACKUP" "$APP"',
     '    /usr/bin/open "$APP"',
@@ -507,7 +558,10 @@ function applyStagedUpdate() {
   ].join('\n')
   fs.mkdirSync(updatesDir(), { recursive: true })
   fs.writeFileSync(scriptPath, script, { encoding: 'utf-8', mode: 0o755 })
-  const child = spawn('/bin/sh', [scriptPath], { detached: true, stdio: 'ignore' })
+  const child = spawn('/bin/sh', [scriptPath, backupPath, state.appPath, state.stagedPath, dmgPath], {
+    detached: true,
+    stdio: 'ignore',
+  })
   child.unref()
   clearUpdateState()
   stagedUpdate = null
@@ -696,6 +750,7 @@ async function installUpdate(sender, payload, launchInstaller) {
     })
     downloaded = true
     const result = await launchInstaller(dest, data, emit)
+    cleanupOldUpdateArtifacts({ keepFileName: fileName })
     if (result && result.ready) {
       // macOS 内置安装：已暂存，等前端确认后 desktop:apply-update 换包重启
       return { launched: false, ready: true, version: data.version || '' }
@@ -775,6 +830,7 @@ function notifyCheckUpdateRequested(win) {
 // 失败以 {ok:false,message} 回给 preload，由 preload reject Error(message)——渲染进程
 // 侧契约不变：成功 resolve {launched:true}，失败 reject Error(message)。
 function registerIpc(options) {
+  cleanupOldUpdateArtifacts()
   const launchInstaller = (options && options.launchInstaller) || defaultLaunchInstaller
   ipcMain.handle('desktop:install-update', async (event, payload) => {
     try {
@@ -824,6 +880,7 @@ module.exports = {
   PROGRESS_CHANNEL,
   applyStagedUpdate,
   checkRelease,
+  cleanupOldUpdateArtifacts,
   defaultLaunchInstaller,
   downloadPackage,
   downloadWithResume,

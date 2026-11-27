@@ -356,6 +356,7 @@ async def execute_prepared_steps(
     emit: Callable[[Dict[str, Any]], Awaitable[None]],
     abort_event: Optional[threading.Event] = None,
     runner: Any = None,
+    start_step_index: int = 0,
 ) -> Dict[str, Any]:
     """执行已准备好的标准步骤（跨端 Runner），过程消息经 emit 推送。
 
@@ -379,6 +380,18 @@ async def execute_prepared_steps(
     aborted = False
     runtime_variables: Dict[str, str] = {}
     owns_runner = runner is None
+    effective_start_step = max(0, int(start_step_index or 0))
+    if prepared_steps and effective_start_step >= len(prepared_steps):
+        return {
+            "step_entries": [],
+            "passed": 0,
+            "failed": 0,
+            "aborted": False,
+            "success": False,
+            "duration": 0.0,
+            "runtime_variables": {},
+            "error": "起始步骤序号超出范围",
+        }
 
     if runner is None and not (abort_event is not None and abort_event.is_set()):
         try:
@@ -416,6 +429,22 @@ async def execute_prepared_steps(
                     }
                 )
                 break
+
+            if index < effective_start_step:
+                skip_reason = f"从第 {effective_start_step + 1} 步开始执行，跳过前置步骤"
+                step_entries.append(_padded_skip_entry(step, index, skip_reason))
+                await emit(
+                    {
+                        "type": "step_update",
+                        "step_id": str(index),
+                        "step_index": index,
+                        "status": "skipped",
+                        "log": f"↷ [{index + 1}/{len(prepared_steps)}] 已跳过（从第 {effective_start_step + 1} 步开始）",
+                        "duration": 0,
+                        "timestamp": _now_iso(),
+                    }
+                )
+                continue
 
             action = step.get("action") if isinstance(step, dict) else ""
             desc = step.get("description", "") if isinstance(step, dict) else ""
@@ -647,6 +676,7 @@ async def run_case_local(
     run_kind: str = "case",
     target_id: Optional[int] = None,
     execution_data: Optional[Dict[str, Any]] = None,
+    start_step_index: int = 0,
 ) -> Dict[str, Any]:
     """本地执行用例（阻塞驱动调用走线程池），过程消息经 emit 推送，结果上报云端。
 
@@ -719,6 +749,11 @@ async def run_case_local(
             await emit({"type": "error", "message": f"步骤准备失败: {exc}"})
             return {"success": False, "error": str(exc)}
 
+        effective_start_step = max(0, int(start_step_index or 0))
+        if prepared_steps and effective_start_step >= len(prepared_steps):
+            await emit({"type": "error", "message": "起始步骤序号超出范围"})
+            return {"success": False, "error": "起始步骤序号超出范围"}
+
         await emit(
             {
                 "type": "run_start",
@@ -746,6 +781,7 @@ async def run_case_local(
                 device_serial=device_serial,
                 emit=emit,
                 abort_event=abort_event,
+                start_step_index=effective_start_step,
             )
             if outcome.get("error"):
                 message = str(outcome["error"])
@@ -1017,6 +1053,7 @@ async def run_case_via_websocket(
     auth_headers: Dict[str, str],
     execution_data: Optional[Dict[str, Any]] = None,
     upstream: Optional[str] = None,
+    start_step_index: int = 0,
 ) -> None:
     """WS /ws/run/{case_id}：连接即执行（语义对齐 ws_run.websocket_run_case）。"""
     from engine import config_store
@@ -1056,6 +1093,7 @@ async def run_case_via_websocket(
             emit=_emit,
             bridge=bridge,
             execution_data=data,
+            start_step_index=start_step_index,
         )
     except Exception as exc:
         logger.exception("WS 本地执行失败: case=%s", case_id)

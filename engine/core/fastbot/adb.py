@@ -10,6 +10,7 @@ from typing import Dict, Optional
 from engine.adb_scan import resolve_adb_binary
 
 ADB_MONITOR_COMMAND_TIMEOUT_SECONDS = 8
+ADB_FILE_TRANSFER_TIMEOUT_SECONDS = 120.0
 
 # serial 白名单（adb/网络隧道形态）；包名白名单（Android 包命名规范）
 _SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9._:-]+$")
@@ -86,24 +87,48 @@ async def _adb_shell_result(
     }
 
 
-async def _adb_push(device_serial: str, local: str, remote: str):
+async def _adb_push(
+    device_serial: str,
+    local: str,
+    remote: str,
+    timeout: Optional[float] = ADB_FILE_TRANSFER_TIMEOUT_SECONDS,
+):
     serial = validate_device_serial(device_serial)
     proc = await asyncio.create_subprocess_exec(
         resolve_adb_binary(), "-s", serial, "push", str(local), str(remote),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    await proc.communicate()
+    try:
+        if timeout is None:
+            await proc.communicate()
+        else:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        await _terminate_subprocess(proc)
+        raise TimeoutError(f"adb push timeout after {timeout}s: {local} -> {remote}") from exc
 
 
-async def _adb_pull(device_serial: str, remote: str, local: str):
+async def _adb_pull(
+    device_serial: str,
+    remote: str,
+    local: str,
+    timeout: Optional[float] = ADB_FILE_TRANSFER_TIMEOUT_SECONDS,
+):
     serial = validate_device_serial(device_serial)
     proc = await asyncio.create_subprocess_exec(
         resolve_adb_binary(), "-s", serial, "pull", str(remote), str(local),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        if timeout is None:
+            stdout, stderr = await proc.communicate()
+        else:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        await _terminate_subprocess(proc)
+        raise TimeoutError(f"adb pull timeout after {timeout}s: {remote}") from exc
     if proc.returncode != 0:
         message = stderr.decode(errors="ignore").strip() or stdout.decode(errors="ignore").strip()
         raise RuntimeError(message or f"adb pull failed: {remote}")

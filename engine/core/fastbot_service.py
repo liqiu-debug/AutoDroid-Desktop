@@ -39,6 +39,7 @@ from engine.core.fastbot import perf_monitor as fastbot_perf
 from engine.core.fastbot.adb import (
     ADB_MONITOR_COMMAND_TIMEOUT_SECONDS,
     _adb_shell,
+    _terminate_subprocess,
     validate_device_serial,
     validate_package_name,
 )
@@ -356,11 +357,7 @@ async def run_fastbot_local(
                 monkey_proc.kill()
             monkey_comm.cancel()
         elif monkey_comm not in done:
-            monkey_proc.terminate()
-            try:
-                await monkey_proc.wait()
-            except Exception:
-                pass
+            await _terminate_subprocess(monkey_proc)
             logger.warning("Monkey 进程超时，已强制终止")
             monkey_comm.cancel()
         for task in pending:

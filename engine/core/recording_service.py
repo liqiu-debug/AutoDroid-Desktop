@@ -44,6 +44,7 @@ from engine.core.utils.android_png import capture_android_png
 logger = logging.getLogger(__name__)
 
 CLICK_IMAGE_REQUIRED_DETAIL = "添加步骤失败：当前点击区域无 Desc/Text，请使用图像点击步骤。"
+CLICK_AMBIGUOUS_LOCATOR_DETAIL = "添加步骤失败：当前元素定位属性在页面存在重复，无法唯一识别，请使用图像点击步骤。"
 CLICK_TARGET_NOT_FOUND_DETAIL = "添加步骤失败：当前点击区域未识别到可录制元素，请重试或使用图像点击步骤。"
 
 # Android u2 连接缓存空闲回收时间；u2 Device 本身无长连接资源，仅避免无限膨胀
@@ -429,17 +430,39 @@ def _perform_device_operation(device, platform: str, operation: str, x: int, y: 
     raise RecordingError(f"不支持的设备操作: {operation}", status_code=400)
 
 
-def _build_step_from_inspect(inspect_res: dict, operation: str = "click") -> dict:
+def _build_step_from_inspect(
+    inspect_res: dict,
+    operation: str = "click",
+    *,
+    locator_config: Optional[Dict[str, Any]] = None,
+) -> dict:
     element = inspect_res.get("element", {})
     strategy = inspect_res["strategy"]
+    selector_value = str(inspect_res.get("selector") or "").strip()
 
     if operation == "click":
-        has_semantic_locator = bool(
-            str(element.get("text") or "").strip()
-            or str(element.get("description") or "").strip()
-        )
-        if strategy not in {"text", "description"} or not has_semantic_locator:
+        if strategy == "ambiguous":
+            raise RecordingError(CLICK_AMBIGUOUS_LOCATOR_DETAIL, status_code=400)
+
+        cfg = locator_config if isinstance(locator_config, dict) else {}
+        enable_id = bool(cfg.get("enable_resource_id", False))
+        enable_class = bool(cfg.get("enable_class_name", False))
+        allowed_strategies = {"text", "description"}
+        if enable_id:
+            allowed_strategies.update({"resourceId", "composite"})
+        if enable_class:
+            allowed_strategies.update({"className", "composite"})
+
+        if strategy not in allowed_strategies or not selector_value:
             raise RecordingError(CLICK_IMAGE_REQUIRED_DETAIL, status_code=400)
+
+        if strategy in {"text", "description"}:
+            has_semantic_locator = bool(
+                str(element.get("text") or "").strip()
+                or str(element.get("description") or "").strip()
+            )
+            if not has_semantic_locator:
+                raise RecordingError(CLICK_IMAGE_REQUIRED_DETAIL, status_code=400)
 
     return {
         "action": "click" if operation == "click" else operation,
@@ -451,10 +474,18 @@ def _build_step_from_inspect(inspect_res: dict, operation: str = "click") -> dic
     }
 
 
-def _build_click_step_from_inspect_result(inspect_res: dict) -> dict:
+def _build_click_step_from_inspect_result(
+    inspect_res: dict,
+    *,
+    locator_config: Optional[Dict[str, Any]] = None,
+) -> dict:
     if "error" in inspect_res:
         raise RecordingError(CLICK_TARGET_NOT_FOUND_DETAIL, status_code=400)
-    return _build_step_from_inspect(inspect_res, operation="click")
+    return _build_step_from_inspect(
+        inspect_res,
+        operation="click",
+        locator_config=locator_config,
+    )
 
 
 def crop_template_image(screenshot_base64: str, x1: int, y1: int, x2: int, y2: int) -> Tuple[bytes, str]:
@@ -511,10 +542,16 @@ def dump_device(
 
 
 @_exclusive_operation
-def inspect_device(x: int, y: int, serial: Optional[str] = None) -> Dict[str, Any]:
+def inspect_device(
+    x: int,
+    y: int,
+    serial: Optional[str] = None,
+    locator_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     cleanup = None
     platform = None
     device = None
+    cfg = locator_config if isinstance(locator_config, dict) else {}
     try:
         platform, device, cleanup = _connect_recording_device(serial)
         xml_dump = _get_device_hierarchy_xml(device, platform=platform)
@@ -523,9 +560,15 @@ def inspect_device(x: int, y: int, serial: Optional[str] = None) -> Dict[str, An
             x,
             y,
             coordinate_scale=_get_recording_coordinate_scale(device, platform),
+            enable_resource_id=bool(cfg.get("enable_resource_id", False)),
+            enable_class_name=bool(cfg.get("enable_class_name", False)),
+            locator_priority=str(cfg.get("priority") or "semantic_first"),
         )
 
-        step = _build_click_step_from_inspect_result(inspect_res)
+        step = _build_click_step_from_inspect_result(
+            inspect_res,
+            locator_config=cfg,
+        )
 
         return {
             "step": step,
@@ -553,10 +596,12 @@ def interact_device(
     record_step: bool = True,
     include_screenshot: bool = True,
     include_device_info: bool = True,
+    locator_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     cleanup = None
     platform = None
     device = None
+    cfg = locator_config if isinstance(locator_config, dict) else {}
     try:
         platform, device, cleanup = _connect_recording_device(device_serial)
 
@@ -570,6 +615,9 @@ def interact_device(
                 x,
                 y,
                 coordinate_scale=coordinate_scale,
+                enable_resource_id=bool(cfg.get("enable_resource_id", False)),
+                enable_class_name=bool(cfg.get("enable_class_name", False)),
+                locator_priority=str(cfg.get("priority") or "semantic_first"),
             )
 
             # 前端传入的 XML 过期时用新 dump 重试（同上游语义）
@@ -581,10 +629,16 @@ def interact_device(
                     x,
                     y,
                     coordinate_scale=coordinate_scale,
+                    enable_resource_id=bool(cfg.get("enable_resource_id", False)),
+                    enable_class_name=bool(cfg.get("enable_class_name", False)),
+                    locator_priority=str(cfg.get("priority") or "semantic_first"),
                 )
 
         if operation == "click" and record_step:
-            step_info = _build_click_step_from_inspect_result(inspect_res)
+            step_info = _build_click_step_from_inspect_result(
+                inspect_res,
+                locator_config=cfg,
+            )
         elif operation != "click":
             step_info = {
                 "action": operation,

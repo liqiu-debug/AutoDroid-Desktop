@@ -39,6 +39,8 @@ let quitting = false
 // child.killed 只表示「kill 信号已发出」，无法用来判断进程是否真正退出；
 // SIGKILL 兜底必须看 exit 标志（由 child.on('exit') 置位）。
 let engineExited = true
+let engineShutdownPromise = null
+let engineShutdownCompleted = false
 // 引擎自动重启状态（C3）：attempts 计「已执行的自动重启次数」，
 // 稳定运行 shell_policies.ENGINE_RESTART_STABLE_MS 后才清零
 // （「起来即崩」的循环不重置预算，最终失败能弹出提示框）。
@@ -381,6 +383,7 @@ function startEngine() {
         cwd: app.isPackaged ? process.resourcesPath : __dirname,
         env: resolveEngineEnv(),
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       })
     } catch (error) {
       reject(new Error(`无法启动引擎进程 ${command}: ${error.message}`))
@@ -388,6 +391,7 @@ function startEngine() {
     }
     engineProcess = child
     engineExited = false
+    engineShutdownCompleted = false
 
     let settled = false
     const timer = setTimeout(() => {
@@ -472,34 +476,81 @@ function stopEngine() {
     engineRestartTimer = null
   }
   enginePendingExitReason = null
+  if (engineShutdownPromise) {
+    return engineShutdownPromise
+  }
   const child = engineProcess
   engineProcess = null
   if (!child || engineExited) {
-    return
+    return Promise.resolve()
   }
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'])
-    } else {
-      child.kill('SIGTERM')
-      const timer = setTimeout(() => {
-        try {
-          // child.killed 在 kill() 后恒为 true，不能用来判断存活；
-          // 只有 exit 事件没触发（engineExited 仍 false）才升级 SIGKILL。
-          if (!engineExited) {
-            child.kill('SIGKILL')
-          }
-        } catch (error) {
-          // 进程可能已退出
-        }
-      }, ENGINE_KILL_GRACE_MS)
-      if (timer.unref) {
-        timer.unref()
+  engineShutdownPromise = new Promise((resolve) => {
+    let settled = false
+    let killTimer = null
+    let hardTimer = null
+    const finish = () => {
+      if (settled) {
+        return
       }
+      settled = true
+      if (killTimer) {
+        clearTimeout(killTimer)
+        killTimer = null
+      }
+      if (hardTimer) {
+        clearTimeout(hardTimer)
+        hardTimer = null
+      }
+      engineShutdownPromise = null
+      resolve()
     }
-  } catch (error) {
-    process.stderr.write(`[engine] 停止失败: ${error.message}\n`)
-  }
+    child.once('exit', finish)
+    try {
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        })
+        killer.once('close', finish)
+        killer.once('error', () => {
+          try {
+            child.kill('SIGKILL')
+          } catch (error) {
+            // 进程可能已退出
+          }
+          finish()
+        })
+        hardTimer = setTimeout(finish, ENGINE_KILL_GRACE_MS)
+        if (hardTimer.unref) {
+          hardTimer.unref()
+        }
+      } else {
+        child.kill('SIGTERM')
+        killTimer = setTimeout(() => {
+          try {
+            // child.killed 在 kill() 后恒为 true，不能用来判断存活；
+            // 只有 exit 事件没触发（engineExited 仍 false）才升级 SIGKILL。
+            if (!engineExited) {
+              child.kill('SIGKILL')
+            }
+          } catch (error) {
+            // 进程可能已退出
+          }
+        }, 2500)
+        if (killTimer.unref) {
+          killTimer.unref()
+        }
+        hardTimer = setTimeout(finish, ENGINE_KILL_GRACE_MS + 500)
+        if (hardTimer.unref) {
+          hardTimer.unref()
+        }
+      }
+    } catch (error) {
+      process.stderr.write(`[engine] 停止失败: ${error.message}\n`)
+      finish()
+    }
+  })
+  return engineShutdownPromise
 }
 
 // ==================== 引擎自动重启 ====================
@@ -604,10 +655,18 @@ app.on('before-quit', () => {
   quitting = true
 })
 
-app.on('will-quit', () => {
-  stopEngine()
+app.on('will-quit', (event) => {
   if (tray) {
     tray.destroy()
     tray = null
   }
+  if (engineProcess && !engineExited && !engineShutdownCompleted) {
+    event.preventDefault()
+    stopEngine().finally(() => {
+      engineShutdownCompleted = true
+      app.quit()
+    })
+    return
+  }
+  stopEngine()
 })
